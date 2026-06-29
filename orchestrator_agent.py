@@ -7,16 +7,23 @@ from fastapi import FastAPI, HTTPException
 from config import (
     DEVELOPER_SERVICE_URL,
     JIRA_SERVICE_URL,
+    REPO_SERVICE_URL,
     REVIEWER_SERVICE_URL,
     configure_logging,
 )
 from schemas import (
     AgentMessage,
     AgentTaskRequest,
+    BranchResponse,
+    CreateBranchRequest,
     DeveloperOutput,
     GenerateRequest,
     GenerateResponse,
     JiraTicket,
+    PrepareRepoRequest,
+    ReadFilesRequest,
+    ReadFilesResponse,
+    RepoInfo,
     ReviewFeedback,
 )
 
@@ -47,6 +54,9 @@ def ticket_to_task(ticket: JiraTicket) -> str:
 @app.post("/work-on-ticket", response_model=GenerateResponse)
 async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
     messages: list[AgentMessage] = []
+    repo: RepoInfo | None = None
+    branch: BranchResponse | None = None
+    repo_files = []
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -57,9 +67,72 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
             ticket = JiraTicket(**ticket_response.json())
 
             task = ticket_to_task(ticket)
+
+            if request.files_to_read:
+                repo_response = await client.post(
+                    f"{REPO_SERVICE_URL}/prepare-repo",
+                    json=PrepareRepoRequest(repo_id=request.repo_id).model_dump(),
+                )
+                repo_response.raise_for_status()
+                repo = RepoInfo(**repo_response.json())
+                messages.append(
+                    AgentMessage(
+                        sender="orchestrator_agent",
+                        receiver="repo_agent",
+                        message_type="repo_prepared",
+                        payload=repo.model_dump(),
+                    )
+                )
+
+                branch_response = await client.post(
+                    f"{REPO_SERVICE_URL}/create-branch",
+                    json=CreateBranchRequest(
+                        repo_id=repo.repo_id,
+                        issue_key=ticket.key,
+                        title=ticket.summary,
+                        base_branch=request.base_branch,
+                    ).model_dump(),
+                )
+                branch_response.raise_for_status()
+                branch = BranchResponse(**branch_response.json())
+                messages.append(
+                    AgentMessage(
+                        sender="orchestrator_agent",
+                        receiver="repo_agent",
+                        message_type="repo_branch_created",
+                        payload=branch.model_dump(),
+                    )
+                )
+
+                files_response = await client.post(
+                    f"{REPO_SERVICE_URL}/read-files",
+                    json=ReadFilesRequest(
+                        repo_id=repo.repo_id,
+                        paths=request.files_to_read,
+                    ).model_dump(),
+                )
+                files_response.raise_for_status()
+                read_files = ReadFilesResponse(**files_response.json())
+                repo_files = read_files.files
+                messages.append(
+                    AgentMessage(
+                        sender="orchestrator_agent",
+                        receiver="repo_agent",
+                        message_type="repo_files_read",
+                        payload={
+                            "repo_id": read_files.repo_id,
+                            "paths": [repo_file.path for repo_file in repo_files],
+                        },
+                    )
+                )
+
             generation_response = await client.post(
                 f"{DEVELOPER_SERVICE_URL}/generate",
-                json=AgentTaskRequest(task=task, ticket=ticket).model_dump(),
+                json=AgentTaskRequest(
+                    task=task,
+                    ticket=ticket,
+                    repo_files=repo_files,
+                ).model_dump(),
             )
             generation_response.raise_for_status()
             original_output = DeveloperOutput(**generation_response.json())
@@ -73,6 +146,9 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                     "ticket": ticket.model_dump(),
                     "code": original_output.code,
                     "explanation": original_output.explanation,
+                    "repo_files": [
+                        repo_file.model_dump() for repo_file in repo_files
+                    ],
                 },
             )
             messages.append(review_request)
@@ -95,6 +171,9 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                     "ticket": ticket.model_dump(),
                     "original_code": original_output.code,
                     "review_feedback": review_feedback.model_dump(),
+                    "repo_files": [
+                        repo_file.model_dump() for repo_file in repo_files
+                    ],
                 },
             )
             messages.append(improvement_request)
@@ -114,6 +193,9 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
             review_feedback=review_feedback,
             improved_code=improved_output,
             messages=messages,
+            repo=repo,
+            branch=branch,
+            repo_files=repo_files,
         )
     except httpx.HTTPStatusError as exc:
         logger.warning("Service API request failed: %s", exc)

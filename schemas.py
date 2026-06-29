@@ -1,10 +1,13 @@
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class GenerateRequest(BaseModel):
     issue_key: str
+    files_to_read: list[str] = Field(default_factory=list)
+    repo_id: str | None = None
+    base_branch: str = "main"
 
 
 class JiraTicket(BaseModel):
@@ -17,14 +20,34 @@ class JiraTicket(BaseModel):
     priority: str | None = None
     assignee: str | None = None
     reporter: str | None = None
-    labels: list[str] = []
-    components: list[str] = []
-    custom_fields: dict[str, Any] = {}
+    labels: list[str] = Field(default_factory=list)
+    components: list[str] = Field(default_factory=list)
+    custom_fields: dict[str, Any] = Field(default_factory=dict)
+
+
+class RepoInfo(BaseModel):
+    repo_id: str
+    path: str
+    current_branch: str | None = None
+    remote_url: str
+    status: str
+
+
+class BranchResponse(BaseModel):
+    repo_id: str
+    branch: str
+    base_branch: str
+
+
+class RepoFile(BaseModel):
+    path: str
+    content: str
 
 
 class AgentTaskRequest(BaseModel):
     task: str
     ticket: JiraTicket | None = None
+    repo_files: list[RepoFile] = Field(default_factory=list)
 
 
 class DeveloperOutput(BaseModel):
@@ -34,10 +57,10 @@ class DeveloperOutput(BaseModel):
 
 class ReviewFeedback(BaseModel):
     approved: bool
-    issues: list[str] = []
-    suggestions: list[str] = []
-    security_notes: list[str] = []
-    quality_notes: list[str] = []
+    issues: list[str] = Field(default_factory=list)
+    suggestions: list[str] = Field(default_factory=list)
+    security_notes: list[str] = Field(default_factory=list)
+    quality_notes: list[str] = Field(default_factory=list)
 
 
 class AgentMessage(BaseModel):
@@ -53,19 +76,14 @@ class GenerateResponse(BaseModel):
     review_feedback: ReviewFeedback
     improved_code: DeveloperOutput
     messages: list[AgentMessage]
+    repo: RepoInfo | None = None
+    branch: BranchResponse | None = None
+    repo_files: list[RepoFile] = Field(default_factory=list)
 
 
 class PrepareRepoRequest(BaseModel):
     repo_url: str | None = None
     repo_id: str | None = None
-
-
-class RepoInfo(BaseModel):
-    repo_id: str
-    path: str
-    current_branch: str | None = None
-    remote_url: str
-    status: str
 
 
 class CreateBranchRequest(BaseModel):
@@ -75,20 +93,9 @@ class CreateBranchRequest(BaseModel):
     base_branch: str = "main"
 
 
-class BranchResponse(BaseModel):
-    repo_id: str
-    branch: str
-    base_branch: str
-
-
 class ReadFilesRequest(BaseModel):
     repo_id: str
     paths: list[str]
-
-
-class RepoFile(BaseModel):
-    path: str
-    content: str
 
 
 class ReadFilesResponse(BaseModel):

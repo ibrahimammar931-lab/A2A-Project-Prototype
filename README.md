@@ -143,9 +143,17 @@ Request:
 
 ```json
 {
-  "issue_key": "PROJ-123"
+  "issue_key": "PROJ-123",
+  "files_to_read": [
+    "app/main.py",
+    "app/routes/users.py",
+    "tests/test_users.py"
+  ],
+  "base_branch": "main"
 }
 ```
+
+`files_to_read` is optional. When it is present, the Orchestrator asks the Repo Agent to prepare the configured GitHub repo, create a ticket branch, read those files, and send their contents to the Developer Agent as project context.
 
 PowerShell example:
 
@@ -154,7 +162,7 @@ Invoke-RestMethod `
   -Uri "http://127.0.0.1:8003/work-on-ticket" `
   -Method Post `
   -ContentType "application/json" `
-  -Body '{"issue_key":"PROJ-123"}'
+  -Body '{"issue_key":"PROJ-123","files_to_read":["app/main.py","tests/test_users.py"],"base_branch":"main"}'
 ```
 
 ## Service Responsibilities
@@ -198,11 +206,14 @@ POST /work-on-ticket
 Orchestrator Service receives issue key
   -> calls Jira Service
   -> converts ticket into a task prompt
+  -> optionally asks Repo Service to prepare the repo, create a branch, and read selected files
   -> calls Developer Service to generate original code
   -> calls Reviewer Service
   -> calls Developer Service to improve the code
   -> returns ticket, original code, review feedback, improved code, and messages
 ```
+
+For the first repo-aware version, file selection is manual through `files_to_read`. A later Planner Agent can choose these files automatically.
 
 Repo Service:
 
@@ -274,6 +285,24 @@ Invoke-RestMethod `
     "code": "from flask import Flask ...",
     "explanation": "Improved implementation."
   },
+  "repo": {
+    "repo_id": "owner-project",
+    "path": "C:\\Users\\ibrah\\Desktop\\A2A\\workspaces\\owner-project",
+    "current_branch": "main",
+    "remote_url": "https://github.com/owner/project.git",
+    "status": "updated"
+  },
+  "branch": {
+    "repo_id": "owner-project",
+    "branch": "agent/PROJ-123-create-a-flask-crud-api-for-users",
+    "base_branch": "main"
+  },
+  "repo_files": [
+    {
+      "path": "app/main.py",
+      "content": "..."
+    }
+  ],
   "messages": []
 }
 ```

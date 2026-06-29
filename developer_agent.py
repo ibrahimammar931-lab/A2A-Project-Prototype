@@ -14,6 +14,7 @@ from schemas import (
     AgentMessage,
     AgentTaskRequest,
     DeveloperOutput,
+    RepoFile,
     ReviewFeedback,
 )
 
@@ -21,6 +22,22 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Developer Agent Service", version="1.0.0")
+
+
+def format_repo_files(repo_files: list[RepoFile]) -> str:
+    if not repo_files:
+        return ""
+
+    formatted_files = []
+    for repo_file in repo_files:
+        formatted_files.append(
+            f"File: {repo_file.path}\n"
+            "```text\n"
+            f"{repo_file.content}\n"
+            "```"
+        )
+
+    return "\n\nRelevant project files:\n\n" + "\n\n".join(formatted_files)
 
 
 class DeveloperAgent:
@@ -32,13 +49,18 @@ class DeveloperAgent:
             base_url="https://api.groq.com/openai/v1",
         )
 
-    def generate_code(self, task: str) -> DeveloperOutput:
+    def generate_code(
+        self,
+        task: str,
+        repo_files: list[RepoFile] | None = None,
+    ) -> DeveloperOutput:
         logger.info("Developer agent generating initial code")
         prompt = (
             "Generate production-minded Python code for this task.\n"
             "Return only valid JSON with exactly these keys: code, explanation.\n"
             "Do not wrap the JSON in Markdown.\n\n"
             f"Task: {task}"
+            f"{format_repo_files(repo_files or [])}"
         )
         return self._ask_groq(prompt)
 
@@ -47,6 +69,7 @@ class DeveloperAgent:
         task: str,
         original_code: str,
         review_feedback: ReviewFeedback,
+        repo_files: list[RepoFile] | None = None,
     ) -> DeveloperOutput:
         logger.info("Developer agent improving code from review feedback")
         prompt = (
@@ -56,6 +79,7 @@ class DeveloperAgent:
             f"Original task:\n{task}\n\n"
             f"Original code:\n{original_code}\n\n"
             f"Reviewer feedback JSON:\n{review_feedback.model_dump_json(indent=2)}"
+            f"{format_repo_files(repo_files or [])}"
         )
         return self._ask_groq(prompt)
 
@@ -88,7 +112,7 @@ class DeveloperAgent:
 def generate_code(request: AgentTaskRequest) -> DeveloperOutput:
     try:
         developer_agent = DeveloperAgent()
-        return developer_agent.generate_code(request.task)
+        return developer_agent.generate_code(request.task, request.repo_files)
     except ValueError as exc:
         logger.warning("Developer output validation failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -106,6 +130,10 @@ def improve_code(message: AgentMessage) -> AgentMessage:
             task=message.payload["task"],
             original_code=message.payload["original_code"],
             review_feedback=review_feedback,
+            repo_files=[
+                RepoFile(**repo_file)
+                for repo_file in message.payload.get("repo_files", [])
+            ],
         )
         return AgentMessage(
             sender="developer_agent",

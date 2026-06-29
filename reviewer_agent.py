@@ -10,12 +10,28 @@ from config import (
     check_config,
     configure_logging,
 )
-from schemas import AgentMessage, ReviewFeedback
+from schemas import AgentMessage, RepoFile, ReviewFeedback
 
 configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Reviewer Agent Service", version="1.0.0")
+
+
+def format_repo_files(repo_files: list[RepoFile]) -> str:
+    if not repo_files:
+        return ""
+
+    formatted_files = []
+    for repo_file in repo_files:
+        formatted_files.append(
+            f"File: {repo_file.path}\n"
+            "```text\n"
+            f"{repo_file.content}\n"
+            "```"
+        )
+
+    return "\n\nRelevant project files:\n\n" + "\n\n".join(formatted_files)
 
 
 class ReviewerAgent:
@@ -27,7 +43,13 @@ class ReviewerAgent:
             base_url="https://api.groq.com/openai/v1",
         )
 
-    def review_code(self, task: str, code: str, explanation: str) -> ReviewFeedback:
+    def review_code(
+        self,
+        task: str,
+        code: str,
+        explanation: str,
+        repo_files: list[RepoFile] | None = None,
+    ) -> ReviewFeedback:
         logger.info("Reviewer agent reviewing developer output")
         prompt = (
             "Review the generated code for bugs, missing validation, security issues, "
@@ -37,6 +59,7 @@ class ReviewerAgent:
             f"Task:\n{task}\n\n"
             f"Developer explanation:\n{explanation}\n\n"
             f"Code:\n{code}"
+            f"{format_repo_files(repo_files or [])}"
         )
 
         response = self.client.chat.completions.create(
@@ -72,6 +95,10 @@ def review(message: AgentMessage) -> AgentMessage:
             task=message.payload["task"],
             code=message.payload["code"],
             explanation=message.payload["explanation"],
+            repo_files=[
+                RepoFile(**repo_file)
+                for repo_file in message.payload.get("repo_files", [])
+            ],
         )
         return AgentMessage(
             sender="reviewer_agent",
