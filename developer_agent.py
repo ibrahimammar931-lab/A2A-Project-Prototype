@@ -57,7 +57,8 @@ class DeveloperAgent:
         logger.info("Developer agent generating initial code")
         prompt = (
             "Generate production-minded Python code for this task.\n"
-            "Return only valid JSON with exactly these keys: code, explanation.\n"
+            "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
+            "The changes value must be a list of objects with path, action, and content.\n"
             "Do not wrap the JSON in Markdown.\n\n"
             f"Task: {task}"
             f"{format_repo_files(repo_files or [])}"
@@ -74,7 +75,8 @@ class DeveloperAgent:
         logger.info("Developer agent improving code from review feedback")
         prompt = (
             "Improve the code using the reviewer feedback.\n"
-            "Return only valid JSON with exactly these keys: code, explanation.\n"
+            "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
+            "The changes value must be a list of objects with path, action, and content.\n"
             "Do not wrap the JSON in Markdown.\n\n"
             f"Original task:\n{task}\n\n"
             f"Original code:\n{original_code}\n\n"

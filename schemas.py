@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -6,7 +8,7 @@ from pydantic import BaseModel, Field
 class GenerateRequest(BaseModel):
     issue_key: str
     files_to_read: list[str] = Field(default_factory=list)
-    repo_id: str | None = None
+    repo_url: str | None = None
     base_branch: str = "main"
 
 
@@ -44,6 +46,12 @@ class RepoFile(BaseModel):
     content: str
 
 
+class FileChange(BaseModel):
+    path: str
+    action: str
+    content: str | None = None
+
+
 class AgentTaskRequest(BaseModel):
     task: str
     ticket: JiraTicket | None = None
@@ -51,8 +59,9 @@ class AgentTaskRequest(BaseModel):
 
 
 class DeveloperOutput(BaseModel):
-    code: str
     explanation: str
+    changes: list[FileChange] = Field(default_factory=list)
+    code: str = ""
 
 
 class ReviewFeedback(BaseModel):
@@ -79,22 +88,26 @@ class GenerateResponse(BaseModel):
     repo: RepoInfo | None = None
     branch: BranchResponse | None = None
     repo_files: list[RepoFile] = Field(default_factory=list)
+    applied_changes: ApplyChangesResponse | None = None
+    diff: RepoDiffResponse | None = None
+    commit: CommitResponse | None = None
+    push: PushResponse | None = None
+    pull_request: PullRequestResponse | None = None
 
 
 class PrepareRepoRequest(BaseModel):
     repo_url: str | None = None
-    repo_id: str | None = None
 
 
 class CreateBranchRequest(BaseModel):
-    repo_id: str
+    repo_url: str
     issue_key: str
     title: str
     base_branch: str = "main"
 
 
 class ReadFilesRequest(BaseModel):
-    repo_id: str
+    repo_url: str
     paths: list[str]
 
 
@@ -103,14 +116,8 @@ class ReadFilesResponse(BaseModel):
     files: list[RepoFile]
 
 
-class FileChange(BaseModel):
-    path: str
-    action: str
-    content: str | None = None
-
-
 class ApplyChangesRequest(BaseModel):
-    repo_id: str
+    repo_url: str
     changes: list[FileChange]
 
 
@@ -120,7 +127,7 @@ class ApplyChangesResponse(BaseModel):
 
 
 class RepoDiffRequest(BaseModel):
-    repo_id: str
+    repo_url: str
 
 
 class RepoDiffResponse(BaseModel):
@@ -129,7 +136,7 @@ class RepoDiffResponse(BaseModel):
 
 
 class CommitRequest(BaseModel):
-    repo_id: str
+    repo_url: str
     issue_key: str
     summary: str
     body: str | None = None
@@ -142,7 +149,7 @@ class CommitResponse(BaseModel):
 
 
 class PushRequest(BaseModel):
-    repo_id: str
+    repo_url: str
     branch: str | None = None
 
 
@@ -153,7 +160,7 @@ class PushResponse(BaseModel):
 
 
 class PullRequestRequest(BaseModel):
-    repo_id: str
+    repo_url: str
     issue_key: str
     title: str
     summary: str

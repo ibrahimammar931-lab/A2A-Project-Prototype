@@ -128,14 +128,6 @@ def ensure_clean_worktree(repo_path: Path) -> None:
         raise ValueError("Repo has uncommitted changes. Commit or discard them first.")
 
 
-def ensure_not_protected_branch(repo_path: Path) -> None:
-    branch = current_branch(repo_path)
-    if not branch:
-        raise ValueError("Refusing to modify repo without an active branch.")
-    if branch in {"main", "master"}:
-        raise ValueError("Refusing to modify protected branch. Create a ticket branch first.")
-
-
 def build_branch_name(issue_key: str, title: str) -> str:
     title_slug = slugify(title)
     return f"agent/{issue_key.upper()}-{title_slug}"[:80].rstrip("-")
@@ -204,7 +196,7 @@ def prepare_repo(request: PrepareRepoRequest) -> RepoInfo:
                 "Missing repo_url. Pass it in the request or set GITHUB_REPO_URL in .env."
             )
 
-        repo_id = request.repo_id or repo_id_from_url(repo_url)
+        repo_id = repo_id_from_url(repo_url)
         repo_path = repo_path_for(repo_id)
 
         if repo_path.exists():
@@ -245,7 +237,8 @@ def prepare_repo(request: PrepareRepoRequest) -> RepoInfo:
 @app.post("/create-branch", response_model=BranchResponse)
 def create_branch(request: CreateBranchRequest) -> BranchResponse:
     try:
-        repo_path = existing_repo_path(request.repo_id)
+        repo_id = repo_id_from_url(request.repo_url)
+        repo_path = existing_repo_path(repo_id)
         ensure_clean_worktree(repo_path)
 
         branch = unique_branch_name(
@@ -257,7 +250,7 @@ def create_branch(request: CreateBranchRequest) -> BranchResponse:
         run_git(repo_path, ["checkout", "-b", branch])
 
         return BranchResponse(
-            repo_id=request.repo_id,
+            repo_id=repo_id,
             branch=branch,
             base_branch=request.base_branch,
         )
@@ -272,7 +265,8 @@ def create_branch(request: CreateBranchRequest) -> BranchResponse:
 @app.post("/read-files", response_model=ReadFilesResponse)
 def read_files(request: ReadFilesRequest) -> ReadFilesResponse:
     try:
-        repo_path = existing_repo_path(request.repo_id)
+        repo_id = repo_id_from_url(request.repo_url)
+        repo_path = existing_repo_path(repo_id)
         files = []
 
         for path in request.paths:
@@ -281,7 +275,7 @@ def read_files(request: ReadFilesRequest) -> ReadFilesResponse:
                 raise ValueError(f"File does not exist: {path}")
             files.append(RepoFile(path=path, content=file_path.read_text(encoding="utf-8")))
 
-        return ReadFilesResponse(repo_id=request.repo_id, files=files)
+        return ReadFilesResponse(repo_id=repo_id, files=files)
     except ValueError as exc:
         logger.warning("Read files validation failed: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -296,8 +290,8 @@ def read_files(request: ReadFilesRequest) -> ReadFilesResponse:
 @app.post("/apply-changes", response_model=ApplyChangesResponse)
 def apply_changes(request: ApplyChangesRequest) -> ApplyChangesResponse:
     try:
-        repo_path = existing_repo_path(request.repo_id)
-        ensure_not_protected_branch(repo_path)
+        repo_id = repo_id_from_url(request.repo_url)
+        repo_path = existing_repo_path(repo_id)
         changed_files = []
 
         for change in request.changes:
@@ -317,10 +311,13 @@ def apply_changes(request: ApplyChangesRequest) -> ApplyChangesResponse:
 
             changed_files.append(change.path)
 
-        return ApplyChangesResponse(repo_id=request.repo_id, changed_files=changed_files)
+        return ApplyChangesResponse(repo_id=repo_id, changed_files=changed_files)
     except ValueError as exc:
         logger.warning("Apply changes validation failed: %s", exc)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=400,
+            detail=f"{str(exc)}; request={request.model_dump_json()}"
+        ) from exc
     except Exception as exc:
         logger.exception("Apply changes failed")
         raise HTTPException(status_code=500, detail="Apply changes failed.") from exc
@@ -329,9 +326,10 @@ def apply_changes(request: ApplyChangesRequest) -> ApplyChangesResponse:
 @app.post("/diff", response_model=RepoDiffResponse)
 def diff(request: RepoDiffRequest) -> RepoDiffResponse:
     try:
-        repo_path = existing_repo_path(request.repo_id)
+        repo_id = repo_id_from_url(request.repo_url)
+        repo_path = existing_repo_path(repo_id)
         repo_diff = run_git(repo_path, ["diff", "--", "."])
-        return RepoDiffResponse(repo_id=request.repo_id, diff=repo_diff)
+        return RepoDiffResponse(repo_id=repo_id, diff=repo_diff)
     except Exception as exc:
         logger.exception("Repo diff failed")
         raise HTTPException(status_code=500, detail="Repo diff failed.") from exc
@@ -340,8 +338,8 @@ def diff(request: RepoDiffRequest) -> RepoDiffResponse:
 @app.post("/commit", response_model=CommitResponse)
 def commit(request: CommitRequest) -> CommitResponse:
     try:
-        repo_path = existing_repo_path(request.repo_id)
-        ensure_not_protected_branch(repo_path)
+        repo_id = repo_id_from_url(request.repo_url)
+        repo_path = existing_repo_path(repo_id)
         status = run_git(repo_path, ["status", "--porcelain"])
         if not status:
             raise ValueError("No changes to commit.")
@@ -352,7 +350,7 @@ def commit(request: CommitRequest) -> CommitResponse:
         commit_sha = run_git(repo_path, ["rev-parse", "HEAD"])
 
         return CommitResponse(
-            repo_id=request.repo_id,
+            repo_id=repo_id,
             commit_sha=commit_sha,
             message=message,
         )
@@ -367,15 +365,14 @@ def commit(request: CommitRequest) -> CommitResponse:
 @app.post("/push", response_model=PushResponse)
 def push(request: PushRequest) -> PushResponse:
     try:
-        repo_path = existing_repo_path(request.repo_id)
+        repo_id = repo_id_from_url(request.repo_url)
+        repo_path = existing_repo_path(repo_id)
         branch = request.branch or current_branch(repo_path)
         if not branch:
             raise ValueError("Could not determine current branch.")
-        if branch in {"main", "master"}:
-            raise ValueError("Refusing to push protected branch.")
 
         run_git(repo_path, ["push", "-u", "origin", branch])
-        return PushResponse(repo_id=request.repo_id, branch=branch)
+        return PushResponse(repo_id=repo_id, branch=branch)
     except ValueError as exc:
         logger.warning("Push validation failed: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -390,12 +387,11 @@ async def open_pr(request: PullRequestRequest) -> PullRequestResponse:
         if not GITHUB_TOKEN:
             raise ValueError("Missing GITHUB_TOKEN. Add it to your .env file.")
 
-        repo_path = existing_repo_path(request.repo_id)
+        repo_id = repo_id_from_url(request.repo_url)
+        repo_path = existing_repo_path(repo_id)
         head_branch = request.head_branch or current_branch(repo_path)
         if not head_branch:
             raise ValueError("Could not determine PR head branch.")
-        if head_branch in {"main", "master"}:
-            raise ValueError("Refusing to open a PR from a protected branch.")
 
         remote_url = run_git(repo_path, ["remote", "get-url", "origin"])
         owner, repo = github_owner_repo(remote_url)
@@ -422,7 +418,7 @@ async def open_pr(request: PullRequestRequest) -> PullRequestResponse:
 
         data = response.json()
         return PullRequestResponse(
-            repo_id=request.repo_id,
+            repo_id=repo_id,
             number=data["number"],
             url=data["html_url"],
             title=data["title"],

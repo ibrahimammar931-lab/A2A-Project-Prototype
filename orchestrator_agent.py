@@ -14,15 +14,23 @@ from config import (
 from schemas import (
     AgentMessage,
     AgentTaskRequest,
+    ApplyChangesRequest,
     BranchResponse,
+    CommitRequest,
+    CommitResponse,
     CreateBranchRequest,
     DeveloperOutput,
     GenerateRequest,
     GenerateResponse,
     JiraTicket,
     PrepareRepoRequest,
+    PushRequest,
+    PushResponse,
+    PullRequestRequest,
+    PullRequestResponse,
     ReadFilesRequest,
     ReadFilesResponse,
+    RepoDiffRequest,
     RepoInfo,
     ReviewFeedback,
 )
@@ -68,10 +76,10 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
 
             task = ticket_to_task(ticket)
 
-            if request.files_to_read:
+            if request.files_to_read or request.repo_url:
                 repo_response = await client.post(
                     f"{REPO_SERVICE_URL}/prepare-repo",
-                    json=PrepareRepoRequest(repo_id=request.repo_id).model_dump(),
+                    json=PrepareRepoRequest(repo_url=request.repo_url).model_dump(),
                 )
                 repo_response.raise_for_status()
                 repo = RepoInfo(**repo_response.json())
@@ -87,7 +95,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 branch_response = await client.post(
                     f"{REPO_SERVICE_URL}/create-branch",
                     json=CreateBranchRequest(
-                        repo_id=repo.repo_id,
+                        repo_url=repo.remote_url,
                         issue_key=ticket.key,
                         title=ticket.summary,
                         base_branch=request.base_branch,
@@ -104,27 +112,28 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                     )
                 )
 
-                files_response = await client.post(
-                    f"{REPO_SERVICE_URL}/read-files",
-                    json=ReadFilesRequest(
-                        repo_id=repo.repo_id,
-                        paths=request.files_to_read,
-                    ).model_dump(),
-                )
-                files_response.raise_for_status()
-                read_files = ReadFilesResponse(**files_response.json())
-                repo_files = read_files.files
-                messages.append(
-                    AgentMessage(
-                        sender="orchestrator_agent",
-                        receiver="repo_agent",
-                        message_type="repo_files_read",
-                        payload={
-                            "repo_id": read_files.repo_id,
-                            "paths": [repo_file.path for repo_file in repo_files],
-                        },
+                if request.files_to_read:
+                    files_response = await client.post(
+                        f"{REPO_SERVICE_URL}/read-files",
+                        json=ReadFilesRequest(
+                            repo_url=repo.remote_url,
+                            paths=request.files_to_read,
+                        ).model_dump(),
                     )
-                )
+                    files_response.raise_for_status()
+                    read_files = ReadFilesResponse(**files_response.json())
+                    repo_files = read_files.files
+                    messages.append(
+                        AgentMessage(
+                            sender="orchestrator_agent",
+                            receiver="repo_agent",
+                            message_type="repo_files_read",
+                            payload={
+                                "repo_id": read_files.repo_id,
+                                "paths": [repo_file.path for repo_file in repo_files],
+                            },
+                        )
+                    )
 
             generation_response = await client.post(
                 f"{DEVELOPER_SERVICE_URL}/generate",
@@ -187,6 +196,125 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
             messages.append(improvement_message)
             improved_output = DeveloperOutput(**improvement_message.payload)
 
+            applied_changes: ApplyChangesResponse | None = None
+            diff: str | None = None
+            commit: CommitResponse | None = None
+            push: PushResponse | None = None
+            pull_request: PullRequestResponse | None = None
+
+            if repo and branch and improved_output.changes:
+                apply_changes_request = ApplyChangesRequest(
+                    repo_url=repo.remote_url,
+                    changes=[change.model_dump() for change in improved_output.changes],
+                )
+                messages.append(
+                    AgentMessage(
+                        sender="orchestrator_agent",
+                        receiver="repo_agent",
+                        message_type="repo_apply_changes_request",
+                        payload=apply_changes_request.model_dump(),
+                    )
+                )
+
+                try:
+                    apply_response = await client.post(
+                        f"{REPO_SERVICE_URL}/apply-changes",
+                        json=apply_changes_request.model_dump(),
+                    )
+                    apply_response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    detail = exc.response.text if exc.response is not None else str(exc)
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            f"Repo apply-changes failed: {detail}\n"
+                            f"Request: {apply_changes_request.model_dump_json()}"
+                        ),
+                    ) from exc
+
+                applied_changes = ApplyChangesResponse(**apply_response.json())
+                messages.append(
+                    AgentMessage(
+                        sender="orchestrator_agent",
+                        receiver="repo_agent",
+                        message_type="repo_changes_applied",
+                        payload=applied_changes.model_dump(),
+                    )
+                )
+
+                diff_response = await client.post(
+                    f"{REPO_SERVICE_URL}/diff",
+                    json=RepoDiffRequest(repo_url=repo.remote_url).model_dump(),
+                )
+                diff_response.raise_for_status()
+                diff = RepoDiffResponse(**diff_response.json()).diff
+                messages.append(
+                    AgentMessage(
+                        sender="orchestrator_agent",
+                        receiver="repo_agent",
+                        message_type="repo_diff_generated",
+                        payload={"repo_id": repo.repo_id, "diff": diff},
+                    )
+                )
+
+                commit_response = await client.post(
+                    f"{REPO_SERVICE_URL}/commit",
+                    json=CommitRequest(
+                        repo_url=repo.remote_url,
+                        issue_key=ticket.key,
+                        summary=ticket.summary,
+                        body=ticket.description,
+                    ).model_dump(),
+                )
+                commit_response.raise_for_status()
+                commit = CommitResponse(**commit_response.json())
+                messages.append(
+                    AgentMessage(
+                        sender="orchestrator_agent",
+                        receiver="repo_agent",
+                        message_type="repo_committed",
+                        payload=commit.model_dump(),
+                    )
+                )
+
+                push_response = await client.post(
+                    f"{REPO_SERVICE_URL}/push",
+                    json=PushRequest(repo_url=repo.remote_url, branch=branch.branch).model_dump(),
+                )
+                push_response.raise_for_status()
+                push = PushResponse(**push_response.json())
+                messages.append(
+                    AgentMessage(
+                        sender="orchestrator_agent",
+                        receiver="repo_agent",
+                        message_type="repo_pushed",
+                        payload=push.model_dump(),
+                    )
+                )
+
+                pr_response = await client.post(
+                    f"{REPO_SERVICE_URL}/open-pr",
+                    json=PullRequestRequest(
+                        repo_url=repo.remote_url,
+                        issue_key=ticket.key,
+                        title=ticket.summary,
+                        summary=ticket.description or "Pull request created by orchestrator.",
+                        base_branch=request.base_branch,
+                        head_branch=branch.branch,
+                        ticket_url=ticket.url,
+                    ).model_dump(),
+                )
+                pr_response.raise_for_status()
+                pull_request = PullRequestResponse(**pr_response.json())
+                messages.append(
+                    AgentMessage(
+                        sender="orchestrator_agent",
+                        receiver="repo_agent",
+                        message_type="repo_pr_opened",
+                        payload=pull_request.model_dump(),
+                    )
+                )
+
         return GenerateResponse(
             ticket=ticket,
             original_code=original_output,
@@ -196,6 +324,11 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
             repo=repo,
             branch=branch,
             repo_files=repo_files,
+            applied_changes=applied_changes,
+            diff=RepoDiffResponse(repo_id=repo.repo_id, diff=diff) if diff is not None else None,
+            commit=commit,
+            push=push,
+            pull_request=pull_request,
         )
     except httpx.HTTPStatusError as exc:
         logger.warning("Service API request failed: %s", exc)

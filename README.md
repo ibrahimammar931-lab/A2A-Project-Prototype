@@ -249,7 +249,7 @@ Invoke-RestMethod `
   -Uri "http://127.0.0.1:8004/create-branch" `
   -Method Post `
   -ContentType "application/json" `
-  -Body '{"repo_id":"owner-project","issue_key":"PROJ-123","title":"Add user API","base_branch":"main"}'
+  -Body '{"repo_url":"https://github.com/owner/project.git","issue_key":"PROJ-123","title":"Add user API","base_branch":"main"}'
 ```
 
 Open a pull request after commit and push:
@@ -259,7 +259,7 @@ Invoke-RestMethod `
   -Uri "http://127.0.0.1:8004/open-pr" `
   -Method Post `
   -ContentType "application/json" `
-  -Body '{"repo_id":"owner-project","issue_key":"PROJ-123","title":"Add user API","summary":"Adds the user API implementation and tests.","base_branch":"main"}'
+  -Body '{"repo_url":"https://github.com/owner/project.git","issue_key":"PROJ-123","title":"Add user API","summary":"Adds the user API implementation and tests.","base_branch":"main"}'
 ```
 
 ## Example Response
