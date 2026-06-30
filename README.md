@@ -1,13 +1,22 @@
 # Simple A2A Microservices Prototype
 
-This project is now split into small FastAPI services:
+This project is a small Agent-to-Agent microservices prototype built with FastAPI.
+It separates Jira retrieval, code generation, code review, and workflow orchestration
+into independent services that communicate over HTTP.
 
-- `jira_agent.py` fetches Jira tickets.
-- `reviewer_agent.py` reviews generated code.
-- `developer_agent.py` generates and improves code.
-- `orchestrator_agent.py` owns the full "work on this ticket" flow.
+For installation, environment variables, and service startup commands, see
+[SETUP.md](SETUP.md).
 
-The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator service coordinates those agents over HTTP.
+## Services
+
+The current version has four services:
+
+```text
+Developer Agent    -> developer_agent.py    -> port 8000
+Jira Agent         -> jira_agent.py         -> port 8001
+Reviewer Agent     -> reviewer_agent.py     -> port 8002
+Orchestrator Agent -> orchestrator_agent.py -> port 8003
+```
 
 ## Project Structure
 
@@ -21,94 +30,25 @@ The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator 
 |-- config.py
 |-- requirements.txt
 |-- .env.example
+|-- SETUP.md
 `-- README.md
 ```
 
-`developer_agent.py` contains the Developer Agent logic and its API.
+## Architecture
 
-`reviewer_agent.py` contains the Reviewer Agent logic and its API.
-
-`jira_agent.py` contains the Jira REST API logic and its API.
-
-`orchestrator_agent.py` contains the cross-agent workflow API.
-
-## Installation
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-```
-
-Edit `.env`:
-
-```env
-GROQ_API_KEY=your_groq_api_key_here
-GROQ_MODEL=llama-3.3-70b-versatile
-GROQ_REVIEWER_MODEL=llama-3.3-70b-versatile
-LOG_LEVEL=INFO
-
-JIRA_BASE_URL=https://your-domain.atlassian.net
-JIRA_EMAIL=your_email@example.com
-JIRA_API_TOKEN=your_jira_api_token_here
-
-DEVELOPER_SERVICE_URL=http://127.0.0.1:8000
-JIRA_SERVICE_URL=http://127.0.0.1:8001
-REVIEWER_SERVICE_URL=http://127.0.0.1:8002
-```
-
-## Run The Services
-
-Open four terminals.
-
-Terminal 1:
-
-```bash
-uvicorn jira_agent:app --port 8001 --reload
-```
-
-Terminal 2:
-
-```bash
-uvicorn reviewer_agent:app --port 8002 --reload
-```
-
-Terminal 3:
-
-```bash
-uvicorn developer_agent:app --port 8000 --reload
-```
-
-Terminal 4:
-
-```bash
-uvicorn orchestrator_agent:app --port 8003 --reload
-```
-
-Developer service docs:
+The Orchestrator owns the full workflow. The Developer Agent does not call Jira or
+Reviewer directly.
 
 ```text
-http://127.0.0.1:8000/docs
+Client
+  -> Orchestrator Agent
+    -> Jira Agent
+    -> Developer Agent
+    -> Reviewer Agent
+    -> Developer Agent
 ```
 
-Orchestrator service docs:
-
-```text
-http://127.0.0.1:8003/docs
-```
-
-Reviewer service docs:
-
-```text
-http://127.0.0.1:8002/docs
-```
-
-Jira service docs:
-
-```text
-http://127.0.0.1:8001/docs
-```
+The services exchange shared Pydantic models from `schemas.py`.
 
 ## Main Workflow
 
@@ -126,62 +66,54 @@ Request:
 }
 ```
 
-PowerShell example:
+The workflow:
 
-```powershell
-Invoke-RestMethod `
-  -Uri "http://127.0.0.1:8003/work-on-ticket" `
-  -Method Post `
-  -ContentType "application/json" `
-  -Body '{"issue_key":"PROJ-123"}'
+```text
+Orchestrator receives issue key
+  -> calls Jira Agent for ticket details
+  -> converts the ticket into a developer task
+  -> calls Developer Agent /generate
+  -> sends generated code to Reviewer Agent /review
+  -> sends reviewer feedback to Developer Agent /improve
+  -> returns original code, review feedback, improved code, and message trace
 ```
 
-## Service Responsibilities
+## Service APIs
 
-Jira Service:
+### Orchestrator Agent
+
+```text
+POST /work-on-ticket
+```
+
+Coordinates the full Jira-to-code workflow.
+
+### Jira Agent
 
 ```text
 GET /tickets/{issue_key}
 ```
 
-It calls Jira REST API and returns a clean `JiraTicket`.
+Fetches a Jira issue through Jira REST API and returns a normalized `JiraTicket`.
 
-Reviewer Service:
-
-```text
-POST /review
-```
-
-It receives a JSON agent message with the task, code, and explanation. It returns review feedback as a JSON message.
-
-Developer Service:
+### Developer Agent
 
 ```text
 POST /generate
 POST /improve
 ```
 
-`/generate` only generates code from a task.
+`/generate` creates initial code from a task.
 
-`/improve` improves code using review feedback.
+`/improve` revises code using reviewer feedback.
 
-Orchestrator Service:
-
-```text
-POST /work-on-ticket
-```
-
-`/work-on-ticket` is the complete flow:
+### Reviewer Agent
 
 ```text
-Orchestrator Service receives issue key
-  -> calls Jira Service
-  -> converts ticket into a task prompt
-  -> calls Developer Service to generate original code
-  -> calls Reviewer Service
-  -> calls Developer Service to improve the code
-  -> returns ticket, original code, review feedback, improved code, and messages
+POST /review
 ```
+
+Reviews generated code and returns structured feedback.
 
 ## Example Response
 
@@ -210,15 +142,31 @@ Orchestrator Service receives issue key
 }
 ```
 
-## Why This Is Microservices
+## Data Models
 
-Each service has its own FastAPI app and can run on its own port:
+Important shared models live in `schemas.py`:
 
 ```text
-Jira Service       -> port 8001
-Reviewer Service   -> port 8002
-Developer Service  -> port 8000
-Orchestrator       -> port 8003
+GenerateRequest
+GenerateResponse
+JiraTicket
+AgentTaskRequest
+DeveloperOutput
+ReviewFeedback
+AgentMessage
 ```
 
-They communicate using HTTP JSON calls. The Orchestrator service coordinates the workflow, so individual agents keep narrow responsibilities.
+## Responsibility Boundary
+
+The service split is intentional:
+
+```text
+Jira Agent         -> Jira API access and Jira field normalization
+Developer Agent    -> code generation and code improvement only
+Reviewer Agent     -> code review only
+Orchestrator Agent -> workflow coordination only
+```
+
+This keeps the Developer Agent from owning external service calls or workflow state,
+which makes the project easier to extend with repo operations, planner agents,
+retry logic, or parallel review later.
