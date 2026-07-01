@@ -6,7 +6,6 @@ This project is now split into small FastAPI services:
 - `reviewer_agent.py` reviews generated code.
 - `developer_agent.py` generates and improves code.
 - `orchestrator_agent.py` owns the full "work on this ticket" flow.
-- `repo_agent.py` clones GitHub repos, manages branches, commits, pushes, and opens pull requests.
 
 The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator service coordinates those agents over HTTP.
 
@@ -18,7 +17,6 @@ The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator 
 |-- reviewer_agent.py
 |-- jira_agent.py
 |-- orchestrator_agent.py
-|-- repo_agent.py
 |-- schemas.py
 |-- config.py
 |-- requirements.txt
@@ -33,8 +31,6 @@ The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator 
 `jira_agent.py` contains the Jira REST API logic and its API.
 
 `orchestrator_agent.py` contains the cross-agent workflow API.
-
-`repo_agent.py` contains repository and GitHub operations. It never merges pull requests.
 
 ## Installation
 
@@ -60,16 +56,11 @@ JIRA_API_TOKEN=your_jira_api_token_here
 DEVELOPER_SERVICE_URL=http://127.0.0.1:8000
 JIRA_SERVICE_URL=http://127.0.0.1:8001
 REVIEWER_SERVICE_URL=http://127.0.0.1:8002
-REPO_SERVICE_URL=http://127.0.0.1:8004
-
-GITHUB_TOKEN=your_github_token_here
-GITHUB_REPO_URL=https://github.com/owner/project.git
-REPO_WORKSPACE_ROOT=./workspaces
 ```
 
 ## Run The Services
 
-Open five terminals.
+Open four terminals.
 
 Terminal 1:
 
@@ -95,12 +86,6 @@ Terminal 4:
 uvicorn orchestrator_agent:app --port 8003 --reload
 ```
 
-Terminal 5:
-
-```bash
-uvicorn repo_agent:app --port 8004 --reload
-```
-
 Developer service docs:
 
 ```text
@@ -123,12 +108,6 @@ Jira service docs:
 
 ```text
 http://127.0.0.1:8001/docs
-```
-
-Repo service docs:
-
-```text
-http://127.0.0.1:8004/docs
 ```
 
 ## Main Workflow
@@ -213,6 +192,7 @@ Orchestrator Service receives issue key
   -> returns ticket, original code, review feedback, improved code, and messages
 ```
 
+<<<<<<< HEAD
 For the first repo-aware version, file selection is manual through `files_to_read`. A later Planner Agent can choose these files automatically.
 
 Repo Service:
@@ -262,6 +242,8 @@ Invoke-RestMethod `
   -Body '{"repo_url":"https://github.com/owner/project.git","issue_key":"PROJ-123","title":"Add user API","summary":"Adds the user API implementation and tests.","base_branch":"main"}'
 ```
 
+=======
+>>>>>>> parent of 8f9fd06 (add git agent)
 ## Example Response
 
 ```json
@@ -316,7 +298,6 @@ Jira Service       -> port 8001
 Reviewer Service   -> port 8002
 Developer Service  -> port 8000
 Orchestrator       -> port 8003
-Repo Service       -> port 8004
 ```
 
 They communicate using HTTP JSON calls. The Orchestrator service coordinates the workflow, so individual agents keep narrow responsibilities.

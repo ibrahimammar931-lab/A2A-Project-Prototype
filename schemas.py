@@ -85,6 +85,7 @@ class GenerateResponse(BaseModel):
     review_feedback: ReviewFeedback
     improved_code: DeveloperOutput
     messages: list[AgentMessage]
+<<<<<<< HEAD
     repo: RepoInfo | None = None
     branch: BranchResponse | None = None
     repo_files: list[RepoFile] = Field(default_factory=list)
@@ -176,3 +177,5 @@ class PullRequestResponse(BaseModel):
     number: int
     url: str
     title: str
+=======
+>>>>>>> parent of 8f9fd06 (add git agent)
