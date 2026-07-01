@@ -34,6 +34,24 @@ def format_repo_files(repo_files: list[RepoFile]) -> str:
     return "\n\nRelevant project files:\n\n" + "\n\n".join(formatted_files)
 
 
+def format_changes(changes: list[dict]) -> str:
+    if not changes:
+        return ""
+
+    formatted_changes = []
+    for change in changes:
+        content = change.get("content") or ""
+        formatted_changes.append(
+            f"Path: {change.get('path')}\n"
+            f"Action: {change.get('action')}\n"
+            "```text\n"
+            f"{content}\n"
+            "```"
+        )
+
+    return "\n\nDeveloper changes:\n\n" + "\n\n".join(formatted_changes)
+
+
 class ReviewerAgent:
     def __init__(self) -> None:
         check_config()
@@ -46,19 +64,19 @@ class ReviewerAgent:
     def review_code(
         self,
         task: str,
-        code: str,
+        changes: list[dict] | None,
         explanation: str,
         repo_files: list[RepoFile] | None = None,
     ) -> ReviewFeedback:
         logger.info("Reviewer agent reviewing developer output")
         prompt = (
-            "Review the generated code for bugs, missing validation, security issues, "
-            "code quality issues, and best-practice violations.\n"
+            "Review only the developer changes for bugs, missing validation, security issues, "
+            "code quality issues, and best-practice violations. Do not review unrelated code.\n"
             "Return only valid JSON with exactly these keys: approved, issues, "
             "suggestions, security_notes, quality_notes.\n\n"
             f"Task:\n{task}\n\n"
             f"Developer explanation:\n{explanation}\n\n"
-            f"Code:\n{code}"
+            f"{format_changes(changes or [])}"
             f"{format_repo_files(repo_files or [])}"
         )
 
@@ -93,7 +111,7 @@ def review(message: AgentMessage) -> AgentMessage:
         reviewer_agent = ReviewerAgent()
         feedback = reviewer_agent.review_code(
             task=message.payload["task"],
-            code=message.payload["code"],
+            changes=message.payload.get("changes"),
             explanation=message.payload["explanation"],
             repo_files=[
                 RepoFile(**repo_file)

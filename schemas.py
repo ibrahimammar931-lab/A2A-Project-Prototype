@@ -2,7 +2,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _looks_like_code(content: str) -> bool:
+    if len(content.strip()) < 20:
+        return False
+
+    if "\n" in content:
+        return True
+
+    code_markers = ["def ", "class ", "import ", "from ", "return ", "if ", "else:", "elif ", "for ", "while "]
+    return any(marker in content for marker in code_markers)
 
 
 class GenerateRequest(BaseModel):
@@ -63,6 +74,21 @@ class DeveloperOutput(BaseModel):
     changes: list[FileChange] = Field(default_factory=list)
     code: str = ""
 
+    @field_validator("changes")
+    def validate_changes(cls, changes: list[FileChange]) -> list[FileChange]:
+        for change in changes:
+            action = change.action.lower().strip()
+            if action in {"create", "update", "upsert"}:
+                if change.content is None:
+                    raise ValueError(
+                        f"FileChange content is required for action {change.action} on {change.path}."
+                    )
+                if not _looks_like_code(change.content):
+                    raise ValueError(
+                        f"FileChange content for {change.path} does not look like code."
+                    )
+        return changes
+
 
 class ReviewFeedback(BaseModel):
     approved: bool
@@ -85,7 +111,6 @@ class GenerateResponse(BaseModel):
     review_feedback: ReviewFeedback
     improved_code: DeveloperOutput
     messages: list[AgentMessage]
-<<<<<<< HEAD
     repo: RepoInfo | None = None
     branch: BranchResponse | None = None
     repo_files: list[RepoFile] = Field(default_factory=list)
@@ -120,11 +145,15 @@ class ReadFilesResponse(BaseModel):
 class ApplyChangesRequest(BaseModel):
     repo_url: str
     changes: list[FileChange]
+    branch: str
+    commit_message: str | None = None
 
 
 class ApplyChangesResponse(BaseModel):
     repo_id: str
     changed_files: list[str]
+    branch: str
+    commit_shas: list[str] = Field(default_factory=list)
 
 
 class RepoDiffRequest(BaseModel):
@@ -177,5 +206,3 @@ class PullRequestResponse(BaseModel):
     number: int
     url: str
     title: str
-=======
->>>>>>> parent of 8f9fd06 (add git agent)

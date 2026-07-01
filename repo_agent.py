@@ -1,8 +1,9 @@
 import logging
 import re
 import subprocess
+from base64 import b64encode
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -90,6 +91,158 @@ def github_owner_repo(remote_url: str) -> tuple[str, str]:
     if len(parts) != 2:
         raise ValueError("Could not parse GitHub owner and repo from remote URL.")
     return parts[0], parts[1]
+
+
+def github_headers() -> dict[str, str]:
+    if not GITHUB_TOKEN:
+        raise ValueError("Missing GITHUB_TOKEN. Add it to your .env file.")
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_api_url(owner: str, repo: str, path: str) -> str:
+    return f"https://api.github.com/repos/{owner}/{repo}{path}"
+
+
+def github_get_ref(owner: str, repo: str, branch: str) -> dict:
+    branch_path = quote(f"heads/{branch}", safe="/")
+    response = httpx.get(
+        github_api_url(owner, repo, f"/git/ref/{branch_path}"),
+        headers=github_headers(),
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def github_branch_exists(owner: str, repo: str, branch: str) -> bool:
+    try:
+        github_get_ref(owner, repo, branch)
+        return True
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return False
+        raise
+
+
+def unique_github_branch_name(owner: str, repo: str, branch: str) -> str:
+    if not github_branch_exists(owner, repo, branch):
+        return branch
+
+    for index in range(2, 100):
+        candidate = f"{branch}-{index}"
+        if not github_branch_exists(owner, repo, candidate):
+            return candidate
+
+    raise ValueError(f"Could not create a unique branch name for {branch}")
+
+
+def github_get_file(owner: str, repo: str, path: str, branch: str) -> dict | None:
+    file_path = quote(path, safe="/")
+    response = httpx.get(
+        github_api_url(owner, repo, f"/contents/{file_path}"),
+        headers=github_headers(),
+        params={"ref": branch},
+        timeout=30,
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    data = response.json()
+    if isinstance(data, list):
+        raise ValueError(f"Path is a directory, not a file: {path}")
+    return data
+
+
+def github_put_file(
+    owner: str,
+    repo: str,
+    path: str,
+    branch: str,
+    message: str,
+    content: str,
+    sha: str | None = None,
+) -> str:
+    file_path = quote(path, safe="/")
+    payload = {
+        "message": message,
+        "content": b64encode(content.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    response = httpx.put(
+        github_api_url(owner, repo, f"/contents/{file_path}"),
+        headers=github_headers(),
+        json=payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()["commit"]["sha"]
+
+
+def github_put_file_with_retry(
+    owner: str,
+    repo: str,
+    path: str,
+    branch: str,
+    message: str,
+    content: str,
+) -> str:
+    existing_file = github_get_file(owner, repo, path, branch)
+    try:
+        return github_put_file(
+            owner=owner,
+            repo=repo,
+            path=path,
+            branch=branch,
+            message=message,
+            content=content,
+            sha=existing_file["sha"] if existing_file else None,
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 409:
+            raise
+
+        logger.warning("GitHub SHA conflict for %s; refetching and retrying", path)
+        existing_file = github_get_file(owner, repo, path, branch)
+        return github_put_file(
+            owner=owner,
+            repo=repo,
+            path=path,
+            branch=branch,
+            message=message,
+            content=content,
+            sha=existing_file["sha"] if existing_file else None,
+        )
+
+
+def github_delete_file(
+    owner: str,
+    repo: str,
+    path: str,
+    branch: str,
+    message: str,
+    sha: str,
+) -> str:
+    file_path = quote(path, safe="/")
+    response = httpx.request(
+        "DELETE",
+        github_api_url(owner, repo, f"/contents/{file_path}"),
+        headers=github_headers(),
+        json={
+            "message": message,
+            "sha": sha,
+            "branch": branch,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()["commit"]["sha"]
 
 
 def repo_path_for(repo_id: str) -> Path:
@@ -187,6 +340,31 @@ def build_pr_body(request: PullRequestRequest) -> str:
     return "\n".join(sections)
 
 
+def normalize_change_action(action: str) -> str:
+    action = action.lower().strip()
+    action_aliases = {
+        "add": "upsert",
+        "added": "upsert",
+        "create": "upsert",
+        "created": "upsert",
+        "modify": "upsert",
+        "modified": "upsert",
+        "update": "upsert",
+        "updated": "upsert",
+        "refactor": "upsert",
+        "refactored": "upsert",
+        "replace": "upsert",
+        "replaced": "upsert",
+        "write": "upsert",
+        "written": "upsert",
+        "remove": "delete",
+        "removed": "delete",
+        "delete": "delete",
+        "deleted": "delete",
+    }
+    return action_aliases.get(action, action)
+
+
 @app.post("/prepare-repo", response_model=RepoInfo)
 def prepare_repo(request: PrepareRepoRequest) -> RepoInfo:
     try:
@@ -238,16 +416,19 @@ def prepare_repo(request: PrepareRepoRequest) -> RepoInfo:
 def create_branch(request: CreateBranchRequest) -> BranchResponse:
     try:
         repo_id = repo_id_from_url(request.repo_url)
-        repo_path = existing_repo_path(repo_id)
-        ensure_clean_worktree(repo_path)
+        owner, repo = github_owner_repo(request.repo_url)
 
-        branch = unique_branch_name(
-            repo_path,
-            build_branch_name(request.issue_key, request.title),
+        branch = build_branch_name(request.issue_key, request.title)
+        branch = unique_github_branch_name(owner, repo, branch)
+        base_ref = github_get_ref(owner, repo, request.base_branch)
+        base_sha = base_ref["object"]["sha"]
+        response = httpx.post(
+            github_api_url(owner, repo, "/git/refs"),
+            headers=github_headers(),
+            json={"ref": f"refs/heads/{branch}", "sha": base_sha},
+            timeout=30,
         )
-        run_git(repo_path, ["fetch", "origin", request.base_branch])
-        run_git(repo_path, ["checkout", "-B", request.base_branch, f"origin/{request.base_branch}"])
-        run_git(repo_path, ["checkout", "-b", branch])
+        response.raise_for_status()
 
         return BranchResponse(
             repo_id=repo_id,
@@ -257,6 +438,9 @@ def create_branch(request: CreateBranchRequest) -> BranchResponse:
     except ValueError as exc:
         logger.warning("Branch creation validation failed: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPStatusError as exc:
+        logger.warning("GitHub branch creation failed: %s", exc.response.text)
+        raise HTTPException(status_code=502, detail=exc.response.text) from exc
     except Exception as exc:
         logger.exception("Branch creation failed")
         raise HTTPException(status_code=500, detail="Branch creation failed.") from exc
@@ -291,33 +475,62 @@ def read_files(request: ReadFilesRequest) -> ReadFilesResponse:
 def apply_changes(request: ApplyChangesRequest) -> ApplyChangesResponse:
     try:
         repo_id = repo_id_from_url(request.repo_url)
-        repo_path = existing_repo_path(repo_id)
+        owner, repo = github_owner_repo(request.repo_url)
+        branch = request.branch
+        if not branch:
+            raise ValueError("Missing branch for GitHub API apply-changes.")
+
         changed_files = []
+        commit_shas = []
 
         for change in request.changes:
-            file_path = safe_repo_file(repo_path, change.path)
-            action = change.action.lower()
+            action = normalize_change_action(change.action)
+            message = request.commit_message or f"Update {change.path}"
 
             if action in {"create", "update", "upsert"}:
                 if change.content is None:
                     raise ValueError(f"Missing content for {change.path}")
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                file_path.write_text(change.content, encoding="utf-8")
+                commit_sha = github_put_file_with_retry(
+                    owner=owner,
+                    repo=repo,
+                    path=change.path,
+                    branch=branch,
+                    message=message,
+                    content=change.content,
+                )
+                commit_shas.append(commit_sha)
             elif action == "delete":
-                if file_path.exists():
-                    file_path.unlink()
+                existing_file = github_get_file(owner, repo, change.path, branch)
+                if existing_file:
+                    commit_sha = github_delete_file(
+                        owner=owner,
+                        repo=repo,
+                        path=change.path,
+                        branch=branch,
+                        message=message,
+                        sha=existing_file["sha"],
+                    )
+                    commit_shas.append(commit_sha)
             else:
                 raise ValueError(f"Unsupported change action: {change.action}")
 
             changed_files.append(change.path)
 
-        return ApplyChangesResponse(repo_id=repo_id, changed_files=changed_files)
+        return ApplyChangesResponse(
+            repo_id=repo_id,
+            changed_files=changed_files,
+            branch=branch,
+            commit_shas=commit_shas,
+        )
     except ValueError as exc:
         logger.warning("Apply changes validation failed: %s", exc)
         raise HTTPException(
             status_code=400,
             detail=f"{str(exc)}; request={request.model_dump_json()}"
         ) from exc
+    except httpx.HTTPStatusError as exc:
+        logger.warning("GitHub apply changes failed: %s", exc.response.text)
+        raise HTTPException(status_code=502, detail=exc.response.text) from exc
     except Exception as exc:
         logger.exception("Apply changes failed")
         raise HTTPException(status_code=500, detail="Apply changes failed.") from exc
@@ -339,15 +552,8 @@ def diff(request: RepoDiffRequest) -> RepoDiffResponse:
 def commit(request: CommitRequest) -> CommitResponse:
     try:
         repo_id = repo_id_from_url(request.repo_url)
-        repo_path = existing_repo_path(repo_id)
-        status = run_git(repo_path, ["status", "--porcelain"])
-        if not status:
-            raise ValueError("No changes to commit.")
-
         message = build_commit_message(request.issue_key, request.summary, request.body)
-        run_git(repo_path, ["add", "--all"])
-        run_git(repo_path, ["commit", "-m", message])
-        commit_sha = run_git(repo_path, ["rev-parse", "HEAD"])
+        commit_sha = "created-by-apply-changes"
 
         return CommitResponse(
             repo_id=repo_id,
@@ -366,12 +572,9 @@ def commit(request: CommitRequest) -> CommitResponse:
 def push(request: PushRequest) -> PushResponse:
     try:
         repo_id = repo_id_from_url(request.repo_url)
-        repo_path = existing_repo_path(repo_id)
-        branch = request.branch or current_branch(repo_path)
+        branch = request.branch
         if not branch:
-            raise ValueError("Could not determine current branch.")
-
-        run_git(repo_path, ["push", "-u", "origin", branch])
+            raise ValueError("Missing branch.")
         return PushResponse(repo_id=repo_id, branch=branch)
     except ValueError as exc:
         logger.warning("Push validation failed: %s", exc)
@@ -388,13 +591,11 @@ async def open_pr(request: PullRequestRequest) -> PullRequestResponse:
             raise ValueError("Missing GITHUB_TOKEN. Add it to your .env file.")
 
         repo_id = repo_id_from_url(request.repo_url)
-        repo_path = existing_repo_path(repo_id)
-        head_branch = request.head_branch or current_branch(repo_path)
+        head_branch = request.head_branch
         if not head_branch:
             raise ValueError("Could not determine PR head branch.")
 
-        remote_url = run_git(repo_path, ["remote", "get-url", "origin"])
-        owner, repo = github_owner_repo(remote_url)
+        owner, repo = github_owner_repo(request.repo_url)
         pr_title = f"{request.issue_key.upper()} {request.title.strip()}"
         payload = {
             "title": pr_title[:256],

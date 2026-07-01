@@ -5,6 +5,7 @@ This project is now split into small FastAPI services:
 - `jira_agent.py` fetches Jira tickets.
 - `reviewer_agent.py` reviews generated code.
 - `developer_agent.py` generates and improves code.
+- `repo_agent.py` handles Git and GitHub operations.
 - `orchestrator_agent.py` owns the full "work on this ticket" flow.
 
 The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator service coordinates those agents over HTTP.
@@ -16,6 +17,7 @@ The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator 
 |-- developer_agent.py
 |-- reviewer_agent.py
 |-- jira_agent.py
+|-- repo_agent.py
 |-- orchestrator_agent.py
 |-- schemas.py
 |-- config.py
@@ -29,6 +31,8 @@ The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator 
 `reviewer_agent.py` contains the Reviewer Agent logic and its API.
 
 `jira_agent.py` contains the Jira REST API logic and its API.
+
+`repo_agent.py` contains the Git/GitHub logic and its API.
 
 `orchestrator_agent.py` contains the cross-agent workflow API.
 
@@ -56,11 +60,16 @@ JIRA_API_TOKEN=your_jira_api_token_here
 DEVELOPER_SERVICE_URL=http://127.0.0.1:8000
 JIRA_SERVICE_URL=http://127.0.0.1:8001
 REVIEWER_SERVICE_URL=http://127.0.0.1:8002
+REPO_SERVICE_URL=http://127.0.0.1:8004
+
+GITHUB_REPO_URL=https://github.com/owner/project.git
+GITHUB_TOKEN=your_github_token_here
+REPO_WORKSPACE_ROOT=workspaces
 ```
 
 ## Run The Services
 
-Open four terminals.
+Open five terminals.
 
 Terminal 1:
 
@@ -86,6 +95,12 @@ Terminal 4:
 uvicorn orchestrator_agent:app --port 8003 --reload
 ```
 
+Terminal 5:
+
+```bash
+uvicorn repo_agent:app --port 8004 --reload
+```
+
 Developer service docs:
 
 ```text
@@ -108,6 +123,12 @@ Jira service docs:
 
 ```text
 http://127.0.0.1:8001/docs
+```
+
+Repo service docs:
+
+```text
+http://127.0.0.1:8004/docs
 ```
 
 ## Main Workflow
@@ -192,7 +213,6 @@ Orchestrator Service receives issue key
   -> returns ticket, original code, review feedback, improved code, and messages
 ```
 
-<<<<<<< HEAD
 For the first repo-aware version, file selection is manual through `files_to_read`. A later Planner Agent can choose these files automatically.
 
 Repo Service:
@@ -202,13 +222,10 @@ POST /prepare-repo
 POST /create-branch
 POST /read-files
 POST /apply-changes
-POST /diff
-POST /commit
-POST /push
 POST /open-pr
 ```
 
-The Repo service owns Git and GitHub operations. It clones or updates a repository, creates ticket branches like `agent/PROJ-123-add-user-api`, reads selected files for the Developer Agent, applies structured file changes, creates commit messages, pushes branches, and opens pull requests. It refuses to edit, push, or open pull requests from `main` or `master`, and it does not merge pull requests.
+The Repo service uses a local clone only for reading project files. It uses GitHub API to create ticket branches, create/update/delete files, commit those changes, and open pull requests. This avoids dirty local repo problems during branch creation and commits.
 
 Prepare the configured repo:
 
@@ -232,18 +249,26 @@ Invoke-RestMethod `
   -Body '{"repo_url":"https://github.com/owner/project.git","issue_key":"PROJ-123","title":"Add user API","base_branch":"main"}'
 ```
 
-Open a pull request after commit and push:
+Apply changes through GitHub API:
+
+```powershell
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8004/apply-changes" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body '{"repo_url":"https://github.com/owner/project.git","branch":"agent/PROJ-123-add-user-api","commit_message":"PROJ-123 add user API","changes":[{"path":"code.py","action":"upsert","content":"print(\"hello\")"}]}'
+```
+
+Open a pull request:
 
 ```powershell
 Invoke-RestMethod `
   -Uri "http://127.0.0.1:8004/open-pr" `
   -Method Post `
   -ContentType "application/json" `
-  -Body '{"repo_url":"https://github.com/owner/project.git","issue_key":"PROJ-123","title":"Add user API","summary":"Adds the user API implementation and tests.","base_branch":"main"}'
+  -Body '{"repo_url":"https://github.com/owner/project.git","issue_key":"PROJ-123","title":"Add user API","summary":"Adds the user API implementation and tests.","base_branch":"main","head_branch":"agent/PROJ-123-add-user-api"}'
 ```
 
-=======
->>>>>>> parent of 8f9fd06 (add git agent)
 ## Example Response
 
 ```json

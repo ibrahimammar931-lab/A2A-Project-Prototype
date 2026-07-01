@@ -57,8 +57,11 @@ class DeveloperAgent:
         logger.info("Developer agent generating initial code")
         prompt = (
             "Generate production-minded Python code for this task.\n"
+            "Make only the smallest changes needed to complete the task.\n"
+            "Do not refactor unrelated code or change the core application design.\n"
             "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
             "The changes value must be a list of objects with path, action, and content.\n"
+            "Each change.content must be the full file contents after the edit, not a summary.\n"
             "Do not wrap the JSON in Markdown.\n\n"
             f"Task: {task}"
             f"{format_repo_files(repo_files or [])}"
@@ -75,8 +78,10 @@ class DeveloperAgent:
         logger.info("Developer agent improving code from review feedback")
         prompt = (
             "Improve the code using the reviewer feedback.\n"
+            "Make only simple, task-focused edits. Preserve the existing code structure and avoid unrelated refactoring.\n"
             "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
             "The changes value must be a list of objects with path, action, and content.\n"
+            "Each change.content must be the full file contents after the edit, not a summary.\n"
             "Do not wrap the JSON in Markdown.\n\n"
             f"Original task:\n{task}\n\n"
             f"Original code:\n{original_code}\n\n"
