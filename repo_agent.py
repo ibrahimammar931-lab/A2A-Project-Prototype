@@ -306,6 +306,19 @@ def unique_branch_name(repo_path: Path, branch: str) -> str:
     raise ValueError(f"Could not create a unique branch name for {branch}")
 
 
+def checkout_branch(repo_path: Path, branch: str) -> None:
+    run_git(repo_path, ["fetch", "origin", "--prune"])
+    try:
+        run_git(repo_path, ["fetch", "origin", branch])
+    except RuntimeError:
+        logger.debug("Remote branch %s was not available yet during fetch", branch)
+
+    if branch_exists(repo_path, branch):
+        run_git(repo_path, ["checkout", branch])
+    else:
+        run_git(repo_path, ["checkout", "-b", branch, f"origin/{branch}"])
+
+
 def build_commit_message(issue_key: str, summary: str, body: str | None) -> str:
     clean_summary = re.sub(r"\s+", " ", summary).strip().rstrip(".")
     if not clean_summary:
@@ -347,6 +360,8 @@ def normalize_change_action(action: str) -> str:
         "added": "upsert",
         "create": "upsert",
         "created": "upsert",
+        "edit": "upsert",
+        "edited": "upsert",
         "modify": "upsert",
         "modified": "upsert",
         "update": "upsert",
@@ -417,6 +432,7 @@ def create_branch(request: CreateBranchRequest) -> BranchResponse:
     try:
         repo_id = repo_id_from_url(request.repo_url)
         owner, repo = github_owner_repo(request.repo_url)
+        repo_path = existing_repo_path(repo_id)
 
         branch = build_branch_name(request.issue_key, request.title)
         branch = unique_github_branch_name(owner, repo, branch)
@@ -429,6 +445,8 @@ def create_branch(request: CreateBranchRequest) -> BranchResponse:
             timeout=30,
         )
         response.raise_for_status()
+
+        checkout_branch(repo_path, branch)
 
         return BranchResponse(
             repo_id=repo_id,

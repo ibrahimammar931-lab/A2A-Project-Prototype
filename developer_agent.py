@@ -56,9 +56,9 @@ class DeveloperAgent:
     ) -> DeveloperOutput:
         logger.info("Developer agent generating initial code")
         prompt = (
-            "Generate production-minded Python code for this task.\n"
-            "Make only the smallest changes needed to complete the task.\n"
-            "Do not refactor unrelated code or change the core application design.\n"
+            "Implement the ticket requirements with the smallest possible change set.\n"
+            "Focus only on the requested behavior and preserve the existing application structure.\n"
+            "Do not refactor unrelated code, add broad validation, or redesign the architecture.\n"
             "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
             "The changes value must be a list of objects with path, action, and content.\n"
             "Each change.content must be the full file contents after the edit, not a summary.\n"
@@ -77,8 +77,10 @@ class DeveloperAgent:
     ) -> DeveloperOutput:
         logger.info("Developer agent improving code from review feedback")
         prompt = (
-            "Improve the code using the reviewer feedback.\n"
-            "Make only simple, task-focused edits. Preserve the existing code structure and avoid unrelated refactoring.\n"
+            "Revise the previous implementation in response to review feedback.\n"
+            "Preserve all previously completed ticket functionality. Do not remove or regress existing behavior.\n"
+            "Only address blocking issues from the review feedback. Ignore optional suggestions and style-only feedback.\n"
+            "Do not refactor unrelated code or change the core design.\n"
             "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
             "The changes value must be a list of objects with path, action, and content.\n"
             "Each change.content must be the full file contents after the edit, not a summary.\n"
@@ -97,8 +99,9 @@ class DeveloperAgent:
                 {
                     "role": "system",
                     "content": (
-                        "You are a senior developer agent. You write clean, secure, "
-                        "well explained code and always respond with strict JSON."
+                        "You are a senior developer agent for a Jira-driven workflow. "
+                        "Implement the ticket requirements precisely and preserve existing behavior. "
+                        "Respond with strict JSON only."
                     ),
                 },
                 {"role": "user", "content": prompt},

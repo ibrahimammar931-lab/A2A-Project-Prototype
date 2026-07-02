@@ -34,22 +34,10 @@ def format_repo_files(repo_files: list[RepoFile]) -> str:
     return "\n\nRelevant project files:\n\n" + "\n\n".join(formatted_files)
 
 
-def format_changes(changes: list[dict]) -> str:
-    if not changes:
+def format_diff(diff: str | None) -> str:
+    if not diff:
         return ""
-
-    formatted_changes = []
-    for change in changes:
-        content = change.get("content") or ""
-        formatted_changes.append(
-            f"Path: {change.get('path')}\n"
-            f"Action: {change.get('action')}\n"
-            "```text\n"
-            f"{content}\n"
-            "```"
-        )
-
-    return "\n\nDeveloper changes:\n\n" + "\n\n".join(formatted_changes)
+    return "\n\nProposed code changes:\n\n" + diff
 
 
 class ReviewerAgent:
@@ -64,19 +52,25 @@ class ReviewerAgent:
     def review_code(
         self,
         task: str,
-        changes: list[dict] | None,
+        ticket: dict | None,
+        diff: str | None,
         explanation: str,
         repo_files: list[RepoFile] | None = None,
     ) -> ReviewFeedback:
         logger.info("Reviewer agent reviewing developer output")
         prompt = (
-            "Review only the developer changes for bugs, missing validation, security issues, "
-            "code quality issues, and best-practice violations. Do not review unrelated code.\n"
-            "Return only valid JSON with exactly these keys: approved, issues, "
-            "suggestions, security_notes, quality_notes.\n\n"
+            "You are reviewing a code change for a Jira ticket. Review only the proposed patch and relevant context.\n"
+            "Your job is to judge whether the change satisfies the ticket requirements and whether it introduces bugs or regressions.\n"
+            "Prioritize: missing requirements, functional bugs, security issues, and performance regressions.\n"
+            "Treat style, naming, documentation, refactoring, and extra validation as optional suggestions unless they are required to make the ticket work safely.\n"
+            "Do not request unrelated redesigns or broad refactors.\n"
+            "Return only valid JSON with exactly these keys: approved, decision, summary, issues, suggestions, security_notes, quality_notes, blocking_issues, optional_suggestions, requires_revision, rationale.\n"
+            "The values for issues, suggestions, security_notes, and quality_notes must be arrays of plain strings.\n"
+            "The values for blocking_issues and optional_suggestions must be arrays of objects with category, severity, summary, recommendation, location, and ticket_relevant.\n\n"
             f"Task:\n{task}\n\n"
+            f"Ticket:\n{json.dumps(ticket or {}, indent=2)}\n\n"
             f"Developer explanation:\n{explanation}\n\n"
-            f"{format_changes(changes or [])}"
+            f"{format_diff(diff)}"
             f"{format_repo_files(repo_files or [])}"
         )
 
@@ -86,9 +80,9 @@ class ReviewerAgent:
                 {
                     "role": "system",
                     "content": (
-                        "You are a strict senior code reviewer. You identify bugs, "
-                        "missing validation, security issues, code quality issues, "
-                        "and best-practice violations. Always respond with strict JSON."
+                        "You are a strict senior code reviewer for a Jira-driven workflow. "
+                        "Judge changes against the ticket requirements, not against personal style preferences. "
+                        "Separate blocking issues from optional suggestions and respond with strict JSON."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -111,7 +105,8 @@ def review(message: AgentMessage) -> AgentMessage:
         reviewer_agent = ReviewerAgent()
         feedback = reviewer_agent.review_code(
             task=message.payload["task"],
-            changes=message.payload.get("changes"),
+            ticket=message.payload.get("ticket"),
+            diff=message.payload.get("diff"),
             explanation=message.payload["explanation"],
             repo_files=[
                 RepoFile(**repo_file)

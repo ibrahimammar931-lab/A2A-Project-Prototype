@@ -1,5 +1,6 @@
 import json
 import logging
+from difflib import unified_diff
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -75,6 +76,43 @@ def ticket_to_task(ticket: JiraTicket) -> str:
         f"Description:\n{ticket.description}\n\n"
         f"Custom fields:\n{json.dumps(ticket.custom_fields, indent=2)}"
     )
+
+
+def build_review_diff(changes: list[dict], repo_files: list) -> str:
+    repo_file_map = {repo_file.path: repo_file.content for repo_file in repo_files}
+    diff_parts: list[str] = []
+
+    for change in changes:
+        path = change.get("path", "")
+        action = str(change.get("action", "")).lower().strip()
+        new_content = change.get("content") or ""
+        old_content = repo_file_map.get(path, "")
+
+        if action in {"delete", "removed", "remove"}:
+            diff_lines = list(
+                unified_diff(
+                    old_content.splitlines(),
+                    [],
+                    fromfile=path,
+                    tofile="/dev/null",
+                    lineterm="",
+                )
+            )
+        else:
+            diff_lines = list(
+                unified_diff(
+                    old_content.splitlines(),
+                    new_content.splitlines(),
+                    fromfile=path if old_content else "/dev/null",
+                    tofile=path,
+                    lineterm="",
+                )
+            )
+
+        if diff_lines:
+            diff_parts.append("\n".join(diff_lines))
+
+    return "\n\n".join(diff_parts)
 
 
 @app.post("/work-on-ticket", response_model=GenerateResponse)
@@ -174,6 +212,10 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 payload={
                     "task": task,
                     "ticket": ticket.model_dump(),
+                    "diff": build_review_diff(
+                        [change.model_dump() for change in original_output.changes],
+                        repo_files,
+                    ),
                     "changes": [change.model_dump() for change in original_output.changes],
                     "explanation": original_output.explanation,
                     "repo_files": [
@@ -192,30 +234,49 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
             messages.append(review_response)
             review_feedback = ReviewFeedback(**review_response.payload)
 
-            improvement_request = AgentMessage(
-                sender="orchestrator_agent",
-                receiver="developer_agent",
-                message_type="code_improvement_request",
-                payload={
-                    "task": task,
-                    "ticket": ticket.model_dump(),
-                    "original_code": original_output.code,
-                    "review_feedback": review_feedback.model_dump(),
-                    "repo_files": [
-                        repo_file.model_dump() for repo_file in repo_files
-                    ],
-                },
-            )
-            messages.append(improvement_request)
+            should_regenerate = bool(review_feedback.requires_revision and review_feedback.blocking_issues)
 
-            improvement_response = await client.post(
-                f"{DEVELOPER_SERVICE_URL}/improve",
-                json=improvement_request.model_dump(),
-            )
-            improvement_response.raise_for_status()
-            improvement_message = AgentMessage(**improvement_response.json())
-            messages.append(improvement_message)
-            improved_output = DeveloperOutput(**improvement_message.payload)
+            if should_regenerate:
+                filtered_feedback = ReviewFeedback(
+                    approved=False,
+                    decision="request_changes",
+                    summary="Address the blocking issues below while preserving the completed ticket behavior.",
+                    issues=[issue.summary for issue in review_feedback.blocking_issues],
+                    suggestions=[issue.recommendation for issue in review_feedback.blocking_issues],
+                    security_notes=[issue.summary for issue in review_feedback.blocking_issues if issue.category == "security"],
+                    quality_notes=[issue.summary for issue in review_feedback.blocking_issues if issue.category in {"bug", "performance", "missing_requirement"}],
+                    blocking_issues=review_feedback.blocking_issues,
+                    optional_suggestions=[],
+                    requires_revision=True,
+                    rationale="Only blocking issues were forwarded for revision.",
+                )
+
+                improvement_request = AgentMessage(
+                    sender="orchestrator_agent",
+                    receiver="developer_agent",
+                    message_type="code_improvement_request",
+                    payload={
+                        "task": task,
+                        "ticket": ticket.model_dump(),
+                        "original_code": original_output.code,
+                        "review_feedback": filtered_feedback.model_dump(),
+                        "repo_files": [
+                            repo_file.model_dump() for repo_file in repo_files
+                        ],
+                    },
+                )
+                messages.append(improvement_request)
+
+                improvement_response = await client.post(
+                    f"{DEVELOPER_SERVICE_URL}/improve",
+                    json=improvement_request.model_dump(),
+                )
+                improvement_response.raise_for_status()
+                improvement_message = AgentMessage(**improvement_response.json())
+                messages.append(improvement_message)
+                improved_output = DeveloperOutput(**improvement_message.payload)
+            else:
+                improved_output = original_output
 
             applied_changes: ApplyChangesResponse | None = None
             diff: str | None = None

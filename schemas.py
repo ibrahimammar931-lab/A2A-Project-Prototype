@@ -74,6 +74,15 @@ class DeveloperOutput(BaseModel):
     changes: list[FileChange] = Field(default_factory=list)
     code: str = ""
 
+    @field_validator("code", mode="before")
+    @classmethod
+    def coerce_code(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return str(value)
+
     @field_validator("changes")
     def validate_changes(cls, changes: list[FileChange]) -> list[FileChange]:
         for change in changes:
@@ -90,12 +99,27 @@ class DeveloperOutput(BaseModel):
         return changes
 
 
+class ReviewIssue(BaseModel):
+    category: str
+    severity: str
+    summary: str
+    recommendation: str
+    location: str | None = None
+    ticket_relevant: bool = True
+
+
 class ReviewFeedback(BaseModel):
     approved: bool
+    decision: str = "approve"
+    summary: str = ""
     issues: list[str] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
     security_notes: list[str] = Field(default_factory=list)
     quality_notes: list[str] = Field(default_factory=list)
+    blocking_issues: list[ReviewIssue] = Field(default_factory=list)
+    optional_suggestions: list[ReviewIssue] = Field(default_factory=list)
+    requires_revision: bool = False
+    rationale: str = ""
 
 
 class AgentMessage(BaseModel):
