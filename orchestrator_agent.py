@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from config import (
     DEVELOPER_SERVICE_URL,
     JIRA_SERVICE_URL,
+    KNOWLEDGE_SERVICE_URL,
     REPO_SERVICE_URL,
     REVIEWER_SERVICE_URL,
     configure_logging,
@@ -194,6 +195,22 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                         )
                     )
 
+                knowledge_response = await post_or_raise(
+                    client,
+                    f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
+                    {"repository_path": repo.path},
+                    "Knowledge ensure",
+                )
+                knowledge = knowledge_response.json()
+                messages.append(
+                    AgentMessage(
+                        sender="orchestrator_agent",
+                        receiver="knowledge_agent",
+                        message_type="knowledge_ensured",
+                        payload=knowledge,
+                    )
+                )
+
             generation_response = await client.post(
                 f"{DEVELOPER_SERVICE_URL}/generate",
                 json=AgentTaskRequest(
@@ -323,6 +340,25 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                         receiver="repo_agent",
                         message_type="repo_changes_applied",
                         payload=applied_changes.model_dump(),
+                    )
+                )
+
+                knowledge_response = await post_or_raise(
+                    client,
+                    f"{KNOWLEDGE_SERVICE_URL}/update-knowledge",
+                    {
+                        "repository_path": repo.path,
+                        "changes": [change.model_dump() for change in improved_output.changes],
+                    },
+                    "Knowledge update",
+                )
+                knowledge_payload = knowledge_response.json()
+                messages.append(
+                    AgentMessage(
+                        sender="orchestrator_agent",
+                        receiver="knowledge_agent",
+                        message_type="knowledge_updated",
+                        payload=knowledge_payload,
                     )
                 )
 
