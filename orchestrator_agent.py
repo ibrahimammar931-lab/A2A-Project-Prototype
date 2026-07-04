@@ -9,6 +9,7 @@ from config import (
     DEVELOPER_SERVICE_URL,
     JIRA_SERVICE_URL,
     KNOWLEDGE_SERVICE_URL,
+    PLANNER_SERVICE_URL,
     REPO_SERVICE_URL,
     REVIEWER_SERVICE_URL,
     configure_logging,
@@ -26,6 +27,8 @@ from schemas import (
     GenerateRequest,
     GenerateResponse,
     JiraTicket,
+    PlanningRequest,
+    PlanningResult,
     PrepareRepoRequest,
     PushRequest,
     PushResponse,
@@ -116,12 +119,32 @@ def build_review_diff(changes: list[dict], repo_files: list) -> str:
     return "\n\n".join(diff_parts)
 
 
+def validate_planned_changes(output: DeveloperOutput, repo_files: list) -> None:
+    allowed_paths = {repo_file.path for repo_file in repo_files}
+    if not allowed_paths:
+        return
+
+    unexpected_paths = [
+        change.path
+        for change in output.changes
+        if change.path not in allowed_paths
+    ]
+    if unexpected_paths:
+        allowed = ", ".join(sorted(allowed_paths))
+        unexpected = ", ".join(unexpected_paths)
+        raise ValueError(
+            "Developer attempted to change files outside the Planner-selected files. "
+            f"Unexpected: {unexpected}. Allowed: {allowed}."
+        )
+
+
 @app.post("/work-on-ticket", response_model=GenerateResponse)
 async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
     messages: list[AgentMessage] = []
     repo: RepoInfo | None = None
     branch: BranchResponse | None = None
     repo_files = []
+    planning_result: PlanningResult | None = None
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -133,81 +156,105 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
 
             task = ticket_to_task(ticket)
 
-            if request.files_to_read or request.repo_url:
-                repo_response = await post_or_raise(
-                    client,
-                    f"{REPO_SERVICE_URL}/prepare-repo",
-                    PrepareRepoRequest(repo_url=request.repo_url).model_dump(),
-                    "Repo prepare",
+            repo_response = await post_or_raise(
+                client,
+                f"{REPO_SERVICE_URL}/prepare-repo",
+                PrepareRepoRequest().model_dump(),
+                "Repo prepare",
+            )
+            repo = RepoInfo(**repo_response.json())
+            messages.append(
+                AgentMessage(
+                    sender="orchestrator_agent",
+                    receiver="repo_agent",
+                    message_type="repo_prepared",
+                    payload=repo.model_dump(),
                 )
-                repo = RepoInfo(**repo_response.json())
-                messages.append(
-                    AgentMessage(
-                        sender="orchestrator_agent",
-                        receiver="repo_agent",
-                        message_type="repo_prepared",
-                        payload=repo.model_dump(),
-                    )
+            )
+
+            knowledge_response = await post_or_raise(
+                client,
+                f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
+                {"repository_path": repo.path},
+                "Knowledge ensure",
+            )
+            knowledge = knowledge_response.json()
+            messages.append(
+                AgentMessage(
+                    sender="orchestrator_agent",
+                    receiver="knowledge_agent",
+                    message_type="knowledge_ensured",
+                    payload=knowledge,
+                )
+            )
+
+            planning_response = await post_or_raise(
+                client,
+                f"{PLANNER_SERVICE_URL}/plan",
+                PlanningRequest(
+                    jira_ticket=ticket,
+                    project_knowledge=knowledge,
+                ).model_dump(),
+                "Planner plan",
+            )
+            planning_result = PlanningResult(**planning_response.json())
+            messages.append(
+                AgentMessage(
+                    sender="orchestrator_agent",
+                    receiver="planner_agent",
+                    message_type="planning_completed",
+                    payload=planning_result.model_dump(),
+                )
+            )
+
+            planned_files = list(dict.fromkeys(planning_result.likely_files))
+            if not planned_files:
+                raise ValueError(
+                    "Planner did not select any likely_files. Refusing to let the Developer create files without repository context."
                 )
 
-                branch_response = await post_or_raise(
+            branch_response = await post_or_raise(
+                client,
+                f"{REPO_SERVICE_URL}/create-branch",
+                CreateBranchRequest(
+                    repo_url=repo.remote_url,
+                    issue_key=ticket.key,
+                    title=ticket.summary,
+                    base_branch=request.base_branch,
+                ).model_dump(),
+                "Repo create-branch",
+            )
+            branch = BranchResponse(**branch_response.json())
+            messages.append(
+                AgentMessage(
+                    sender="orchestrator_agent",
+                    receiver="repo_agent",
+                    message_type="repo_branch_created",
+                    payload=branch.model_dump(),
+                )
+            )
+
+            if planned_files:
+                files_response = await post_or_raise(
                     client,
-                    f"{REPO_SERVICE_URL}/create-branch",
-                    CreateBranchRequest(
+                    f"{REPO_SERVICE_URL}/read-files",
+                    ReadFilesRequest(
                         repo_url=repo.remote_url,
-                        issue_key=ticket.key,
-                        title=ticket.summary,
-                        base_branch=request.base_branch,
+                        paths=planned_files,
                     ).model_dump(),
-                    "Repo create-branch",
+                    "Repo read-files",
                 )
-                branch = BranchResponse(**branch_response.json())
+                read_files = ReadFilesResponse(**files_response.json())
+                repo_files = read_files.files
                 messages.append(
                     AgentMessage(
                         sender="orchestrator_agent",
                         receiver="repo_agent",
-                        message_type="repo_branch_created",
-                        payload=branch.model_dump(),
-                    )
-                )
-
-                if request.files_to_read:
-                    files_response = await post_or_raise(
-                        client,
-                        f"{REPO_SERVICE_URL}/read-files",
-                        ReadFilesRequest(
-                            repo_url=repo.remote_url,
-                            paths=request.files_to_read,
-                        ).model_dump(),
-                        "Repo read-files",
-                    )
-                    read_files = ReadFilesResponse(**files_response.json())
-                    repo_files = read_files.files
-                    messages.append(
-                        AgentMessage(
-                            sender="orchestrator_agent",
-                            receiver="repo_agent",
-                            message_type="repo_files_read",
-                            payload={
-                                "repo_id": read_files.repo_id,
-                                "paths": [repo_file.path for repo_file in repo_files],
-                            },
-                        )
-                    )
-
-                knowledge_response = await post_or_raise(
-                    client,
-                    f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
-                    {"repository_path": repo.path},
-                    "Knowledge ensure",
-                )
-                knowledge = knowledge_response.json()
-                messages.append(
-                    AgentMessage(
-                        sender="orchestrator_agent",
-                        receiver="knowledge_agent",
-                        message_type="knowledge_ensured",
-                        payload=knowledge,
+                        message_type="repo_files_read",
+                        payload={
+                            "repo_id": read_files.repo_id,
+                            "paths": [repo_file.path for repo_file in repo_files],
+                        },
                     )
                 )
 
@@ -216,11 +263,13 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 json=AgentTaskRequest(
                     task=task,
                     ticket=ticket,
+                    planning_result=planning_result,
                     repo_files=repo_files,
                 ).model_dump(),
             )
             generation_response.raise_for_status()
             original_output = DeveloperOutput(**generation_response.json())
+            validate_planned_changes(original_output, repo_files)
 
             review_request = AgentMessage(
                 sender="orchestrator_agent",
@@ -229,6 +278,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 payload={
                     "task": task,
                     "ticket": ticket.model_dump(),
+                    "planning_result": planning_result.model_dump() if planning_result else None,
                     "diff": build_review_diff(
                         [change.model_dump() for change in original_output.changes],
                         repo_files,
@@ -275,6 +325,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                     payload={
                         "task": task,
                         "ticket": ticket.model_dump(),
+                        "planning_result": planning_result.model_dump() if planning_result else None,
                         "original_code": original_output.code,
                         "review_feedback": filtered_feedback.model_dump(),
                         "repo_files": [
@@ -292,6 +343,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 improvement_message = AgentMessage(**improvement_response.json())
                 messages.append(improvement_message)
                 improved_output = DeveloperOutput(**improvement_message.payload)
+                validate_planned_changes(improved_output, repo_files)
             else:
                 improved_output = original_output
 
@@ -433,6 +485,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
             review_feedback=review_feedback,
             improved_code=improved_output,
             messages=messages,
+            planning_result=planning_result,
             repo=repo,
             branch=branch,
             repo_files=repo_files,

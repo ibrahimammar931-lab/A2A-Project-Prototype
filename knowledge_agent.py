@@ -133,19 +133,22 @@ class KnowledgeAgent:
                     logger.info("Removed knowledge for deleted file: %s", change.path)
                 continue
 
-            target_file = repo / rel_path
-            if not target_file.exists():
-                # If the file no longer exists, remove knowledge if present
-                if knowledge_file.exists():
-                    knowledge_file.unlink()
-                    removed += 1
-                continue
+            if change.content is not None:
+                content = change.content
+            else:
+                target_file = repo / rel_path
+                if not target_file.exists():
+                    # If the file no longer exists, remove knowledge if present
+                    if knowledge_file.exists():
+                        knowledge_file.unlink()
+                        removed += 1
+                    continue
 
-            try:
-                content = target_file.read_text(encoding="utf-8")
-            except Exception:
-                logger.warning("Could not read changed file for knowledge update: %s", target_file)
-                continue
+                try:
+                    content = target_file.read_text(encoding="utf-8")
+                except Exception:
+                    logger.warning("Could not read changed file for knowledge update: %s", target_file)
+                    continue
 
             knowledge = self._summarize_file(str(rel_path), content)
             knowledge_file.parent.mkdir(parents=True, exist_ok=True)

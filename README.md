@@ -3,6 +3,9 @@
 This project is now split into small FastAPI services:
 
 - `jira_agent.py` fetches Jira tickets.
+- `knowledge_agent.py` maintains repository knowledge.
+- `planner_agent.py` produces implementation plans from tickets and knowledge.
+- `repo_agent.py` reads and updates GitHub repositories.
 - `reviewer_agent.py` reviews generated code.
 - `developer_agent.py` generates and improves code.
 - `orchestrator_agent.py` owns the full "work on this ticket" flow.
@@ -16,6 +19,9 @@ The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator 
 |-- developer_agent.py
 |-- reviewer_agent.py
 |-- jira_agent.py
+|-- knowledge_agent.py
+|-- planner_agent.py
+|-- repo_agent.py
 |-- orchestrator_agent.py
 |-- schemas.py
 |-- config.py
@@ -29,6 +35,12 @@ The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator 
 `reviewer_agent.py` contains the Reviewer Agent logic and its API.
 
 `jira_agent.py` contains the Jira REST API logic and its API.
+
+`knowledge_agent.py` maintains structured repository knowledge.
+
+`planner_agent.py` plans implementation work without generating code or editing files.
+
+`repo_agent.py` reads selected files and applies GitHub API changes.
 
 `orchestrator_agent.py` contains the cross-agent workflow API.
 
@@ -47,6 +59,7 @@ Edit `.env`:
 GROQ_API_KEY=your_groq_api_key_here
 GROQ_MODEL=llama-3.3-70b-versatile
 GROQ_REVIEWER_MODEL=llama-3.3-70b-versatile
+GROQ_PLANNER_MODEL=llama-3.3-70b-versatile
 LOG_LEVEL=INFO
 
 JIRA_BASE_URL=https://your-domain.atlassian.net
@@ -56,11 +69,14 @@ JIRA_API_TOKEN=your_jira_api_token_here
 DEVELOPER_SERVICE_URL=http://127.0.0.1:8000
 JIRA_SERVICE_URL=http://127.0.0.1:8001
 REVIEWER_SERVICE_URL=http://127.0.0.1:8002
+REPO_SERVICE_URL=http://127.0.0.1:8004
+KNOWLEDGE_SERVICE_URL=http://127.0.0.1:8005
+PLANNER_SERVICE_URL=http://127.0.0.1:8006
 ```
 
 ## Run The Services
 
-Open four terminals.
+Open seven terminals.
 
 Terminal 1:
 
@@ -84,6 +100,24 @@ Terminal 4:
 
 ```bash
 uvicorn orchestrator_agent:app --port 8003 --reload
+```
+
+Terminal 5:
+
+```bash
+uvicorn repo_agent:app --port 8004 --reload
+```
+
+Terminal 6:
+
+```bash
+uvicorn knowledge_agent:app --port 8005 --reload
+```
+
+Terminal 7:
+
+```bash
+uvicorn planner_agent:app --port 8006 --reload
 ```
 
 Developer service docs:
@@ -110,6 +144,12 @@ Jira service docs:
 http://127.0.0.1:8001/docs
 ```
 
+Planner service docs:
+
+```text
+http://127.0.0.1:8006/docs
+```
+
 ## Main Workflow
 
 Call the Orchestrator service:
@@ -123,16 +163,11 @@ Request:
 ```json
 {
   "issue_key": "PROJ-123",
-  "files_to_read": [
-    "app/main.py",
-    "app/routes/users.py",
-    "tests/test_users.py"
-  ],
   "base_branch": "main"
 }
 ```
 
-`files_to_read` is optional. When it is present, the Orchestrator asks the Repo Agent to prepare the configured GitHub repo, create a ticket branch, read those files, and send their contents to the Developer Agent as project context.
+The Orchestrator uses `GITHUB_REPO_URL` from `.env`. The Planner Agent chooses the files to read from the knowledge base.
 
 PowerShell example:
 
@@ -141,7 +176,7 @@ Invoke-RestMethod `
   -Uri "http://127.0.0.1:8003/work-on-ticket" `
   -Method Post `
   -ContentType "application/json" `
-  -Body '{"issue_key":"PROJ-123","files_to_read":["app/main.py","tests/test_users.py"],"base_branch":"main"}'
+  -Body '{"issue_key":"PROJ-123","base_branch":"main"}'
 ```
 
 ## Service Responsibilities
@@ -185,14 +220,17 @@ POST /work-on-ticket
 Orchestrator Service receives issue key
   -> calls Jira Service
   -> converts ticket into a task prompt
-  -> optionally asks Repo Service to prepare the repo, create a branch, and read selected files
+  -> asks Repo Service to prepare the repo
+  -> asks Knowledge Agent to ensure repository knowledge exists
+  -> asks Planner Agent to produce a structured plan
+  -> asks Repo Service to read Planner likely_files
   -> calls Developer Service to generate original code
   -> calls Reviewer Service
   -> calls Developer Service to improve the code
   -> returns ticket, original code, review feedback, improved code, and messages
 ```
 
-For the first repo-aware version, file selection is manual through `files_to_read`. A later Planner Agent can choose these files automatically.
+The Planner Agent never calls the Repository Agent or Developer Agent directly. Only the Orchestrator coordinates those calls.
 
 Repo Service:
 
@@ -201,13 +239,10 @@ POST /prepare-repo
 POST /create-branch
 POST /read-files
 POST /apply-changes
-POST /diff
-POST /commit
-POST /push
 POST /open-pr
 ```
 
-The Repo service owns Git and GitHub operations. It clones or updates a repository, creates ticket branches like `agent/PROJ-123-add-user-api`, reads selected files for the Developer Agent, applies structured file changes, creates commit messages, pushes branches, and opens pull requests. It refuses to edit, push, or open pull requests from `main` or `master`, and it does not merge pull requests.
+The Repo service owns repository operations. It uses the local clone for reading files, and GitHub API for creating ticket branches, applying structured file changes, committing changes, and opening pull requests.
 
 Prepare the configured repo:
 
@@ -219,8 +254,6 @@ Invoke-RestMethod `
   -Body '{}'
 ```
 
-You can still override the configured repo per request by passing `repo_url`.
-
 Create a branch:
 
 ```powershell
@@ -231,7 +264,7 @@ Invoke-RestMethod `
   -Body '{"repo_url":"https://github.com/owner/project.git","issue_key":"PROJ-123","title":"Add user API","base_branch":"main"}'
 ```
 
-Open a pull request after commit and push:
+Open a pull request after `apply-changes`:
 
 ```powershell
 Invoke-RestMethod `

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -18,8 +18,6 @@ def _looks_like_code(content: str) -> bool:
 
 class GenerateRequest(BaseModel):
     issue_key: str
-    files_to_read: list[str] = Field(default_factory=list)
-    repo_url: str | None = None
     base_branch: str = "main"
 
 
@@ -63,9 +61,26 @@ class FileChange(BaseModel):
     content: str | None = None
 
 
+class PlanningRequest(BaseModel):
+    jira_ticket: JiraTicket
+    project_knowledge: dict[str, Any]
+
+
+class PlanningResult(BaseModel):
+    task_summary: str
+    requirements: list[str] = Field(default_factory=list)
+    implementation_steps: list[str] = Field(default_factory=list)
+    likely_modules: list[str] = Field(default_factory=list)
+    likely_files: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    complexity: Literal["Low", "Medium", "High"]
+
+
 class AgentTaskRequest(BaseModel):
     task: str
     ticket: JiraTicket | None = None
+    planning_result: PlanningResult | None = None
     repo_files: list[RepoFile] = Field(default_factory=list)
 
 
@@ -135,6 +150,7 @@ class GenerateResponse(BaseModel):
     review_feedback: ReviewFeedback
     improved_code: DeveloperOutput
     messages: list[AgentMessage]
+    planning_result: PlanningResult | None = None
     repo: RepoInfo | None = None
     branch: BranchResponse | None = None
     repo_files: list[RepoFile] = Field(default_factory=list)

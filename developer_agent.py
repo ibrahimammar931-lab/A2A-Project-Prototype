@@ -14,6 +14,7 @@ from schemas import (
     AgentMessage,
     AgentTaskRequest,
     DeveloperOutput,
+    PlanningResult,
     RepoFile,
     ReviewFeedback,
 )
@@ -40,6 +41,31 @@ def format_repo_files(repo_files: list[RepoFile]) -> str:
     return "\n\nRelevant project files:\n\n" + "\n\n".join(formatted_files)
 
 
+def format_allowed_files(repo_files: list[RepoFile]) -> str:
+    if not repo_files:
+        return (
+            "\n\nAllowed file changes:\n"
+            "- No repository files were provided. Do not create new files unless the Jira ticket explicitly requires a new file.\n"
+        )
+
+    paths = "\n".join(f"- {repo_file.path}" for repo_file in repo_files)
+    return (
+        "\n\nAllowed file changes:\n"
+        "Only modify the files listed below. Do not create new files. Do not rename files. "
+        "If the requested behavior can be implemented in these files, update these files only.\n"
+        f"{paths}\n"
+    )
+
+
+def format_plan(planning_result: PlanningResult | None) -> str:
+    if not planning_result:
+        return ""
+    return (
+        "\n\nImplementation plan:\n"
+        f"{planning_result.model_dump_json(indent=2)}"
+    )
+
+
 class DeveloperAgent:
     def __init__(self) -> None:
         check_config()
@@ -52,6 +78,7 @@ class DeveloperAgent:
     def generate_code(
         self,
         task: str,
+        planning_result: PlanningResult | None = None,
         repo_files: list[RepoFile] | None = None,
     ) -> DeveloperOutput:
         logger.info("Developer agent generating initial code")
@@ -59,11 +86,14 @@ class DeveloperAgent:
             "Implement the ticket requirements with the smallest possible change set.\n"
             "Focus only on the requested behavior and preserve the existing application structure.\n"
             "Do not refactor unrelated code, add broad validation, or redesign the architecture.\n"
+            "Prefer updating existing relevant files over creating new files.\n"
             "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
             "The changes value must be a list of objects with path, action, and content.\n"
             "Each change.content must be the full file contents after the edit, not a summary.\n"
             "Do not wrap the JSON in Markdown.\n\n"
             f"Task: {task}"
+            f"{format_plan(planning_result)}"
+            f"{format_allowed_files(repo_files or [])}"
             f"{format_repo_files(repo_files or [])}"
         )
         return self._ask_groq(prompt)
@@ -73,6 +103,7 @@ class DeveloperAgent:
         task: str,
         original_code: str,
         review_feedback: ReviewFeedback,
+        planning_result: PlanningResult | None = None,
         repo_files: list[RepoFile] | None = None,
     ) -> DeveloperOutput:
         logger.info("Developer agent improving code from review feedback")
@@ -81,6 +112,7 @@ class DeveloperAgent:
             "Preserve all previously completed ticket functionality. Do not remove or regress existing behavior.\n"
             "Only address blocking issues from the review feedback. Ignore optional suggestions and style-only feedback.\n"
             "Do not refactor unrelated code or change the core design.\n"
+            "Prefer updating existing relevant files over creating new files.\n"
             "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
             "The changes value must be a list of objects with path, action, and content.\n"
             "Each change.content must be the full file contents after the edit, not a summary.\n"
@@ -88,6 +120,8 @@ class DeveloperAgent:
             f"Original task:\n{task}\n\n"
             f"Original code:\n{original_code}\n\n"
             f"Reviewer feedback JSON:\n{review_feedback.model_dump_json(indent=2)}"
+            f"{format_plan(planning_result)}"
+            f"{format_allowed_files(repo_files or [])}"
             f"{format_repo_files(repo_files or [])}"
         )
         return self._ask_groq(prompt)
@@ -122,7 +156,11 @@ class DeveloperAgent:
 def generate_code(request: AgentTaskRequest) -> DeveloperOutput:
     try:
         developer_agent = DeveloperAgent()
-        return developer_agent.generate_code(request.task, request.repo_files)
+        return developer_agent.generate_code(
+            request.task,
+            request.planning_result,
+            request.repo_files,
+        )
     except ValueError as exc:
         logger.warning("Developer output validation failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -140,6 +178,11 @@ def improve_code(message: AgentMessage) -> AgentMessage:
             task=message.payload["task"],
             original_code=message.payload["original_code"],
             review_feedback=review_feedback,
+            planning_result=(
+                PlanningResult(**message.payload["planning_result"])
+                if message.payload.get("planning_result")
+                else None
+            ),
             repo_files=[
                 RepoFile(**repo_file)
                 for repo_file in message.payload.get("repo_files", [])
