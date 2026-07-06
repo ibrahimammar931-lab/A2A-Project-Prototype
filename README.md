@@ -167,7 +167,7 @@ Request:
 }
 ```
 
-The Orchestrator uses `GITHUB_REPO_URL` from `.env`. The Planner Agent chooses the files to read from the knowledge base.
+The Orchestrator uses `GITHUB_REPO_URL` from `.env`. The Planner Agent chooses which existing files to read from the knowledge base and which new files should be created.
 
 PowerShell example:
 
@@ -223,7 +223,7 @@ Orchestrator Service receives issue key
   -> asks Repo Service to prepare the repo
   -> asks Knowledge Agent to ensure repository knowledge exists
   -> asks Planner Agent to produce a structured plan
-  -> asks Repo Service to read Planner likely_files
+  -> asks Repo Service to read Planner likely_existing_files
   -> calls Developer Service to generate original code
   -> calls Reviewer Service
   -> calls Developer Service to improve the code

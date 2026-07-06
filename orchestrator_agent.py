@@ -53,13 +53,18 @@ async def post_or_raise(
     payload: dict,
     step: str,
 ) -> httpx.Response:
-    response = await client.post(url, json=payload)
     try:
+        response = await client.post(url, json=payload)
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=502,
             detail=f"{step} failed with {response.status_code}: {response.text}",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{step} failed due to a transport error: {exc}",
         ) from exc
     return response
 
@@ -127,7 +132,8 @@ def validate_planned_changes(output: DeveloperOutput, repo_files: list) -> None:
     unexpected_paths = [
         change.path
         for change in output.changes
-        if change.path not in allowed_paths
+        if change.action.lower().strip() in {"update", "delete", "upsert"}
+        and change.path not in allowed_paths
     ]
     if unexpected_paths:
         allowed = ", ".join(sorted(allowed_paths))
@@ -207,11 +213,8 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 )
             )
 
-            planned_files = list(dict.fromkeys(planning_result.likely_files))
-            if not planned_files:
-                raise ValueError(
-                    "Planner did not select any likely_files. Refusing to let the Developer create files without repository context."
-                )
+            planned_existing_files = list(dict.fromkeys(planning_result.likely_existing_files))
+            planned_new_files = list(dict.fromkeys(planning_result.new_files))
 
             branch_response = await post_or_raise(
                 client,
@@ -234,13 +237,13 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 )
             )
 
-            if planned_files:
+            if planned_existing_files:
                 files_response = await post_or_raise(
                     client,
                     f"{REPO_SERVICE_URL}/read-files",
                     ReadFilesRequest(
                         repo_url=repo.remote_url,
-                        paths=planned_files,
+                        paths=planned_existing_files,
                     ).model_dump(),
                     "Repo read-files",
                 )
@@ -258,16 +261,18 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                     )
                 )
 
-            generation_response = await client.post(
+            generation_response = await post_or_raise(
+                client,
                 f"{DEVELOPER_SERVICE_URL}/generate",
-                json=AgentTaskRequest(
+                AgentTaskRequest(
                     task=task,
                     ticket=ticket,
                     planning_result=planning_result,
+                    planned_new_files=planned_new_files,
                     repo_files=repo_files,
                 ).model_dump(),
+                "Developer generate",
             )
-            generation_response.raise_for_status()
             original_output = DeveloperOutput(**generation_response.json())
             validate_planned_changes(original_output, repo_files)
 
@@ -292,11 +297,12 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
             )
             messages.append(review_request)
 
-            reviewer_response = await client.post(
+            reviewer_response = await post_or_raise(
+                client,
                 f"{REVIEWER_SERVICE_URL}/review",
-                json=review_request.model_dump(),
+                review_request.model_dump(),
+                "Reviewer review",
             )
-            reviewer_response.raise_for_status()
             review_response = AgentMessage(**reviewer_response.json())
             messages.append(review_response)
             review_feedback = ReviewFeedback(**review_response.payload)
@@ -327,6 +333,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                         "ticket": ticket.model_dump(),
                         "planning_result": planning_result.model_dump() if planning_result else None,
                         "original_code": original_output.code,
+                        "planned_new_files": planned_new_files,
                         "review_feedback": filtered_feedback.model_dump(),
                         "repo_files": [
                             repo_file.model_dump() for repo_file in repo_files
@@ -335,11 +342,12 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 )
                 messages.append(improvement_request)
 
-                improvement_response = await client.post(
+                improvement_response = await post_or_raise(
+                    client,
                     f"{DEVELOPER_SERVICE_URL}/improve",
-                    json=improvement_request.model_dump(),
+                    improvement_request.model_dump(),
+                    "Developer improve",
                 )
-                improvement_response.raise_for_status()
                 improvement_message = AgentMessage(**improvement_response.json())
                 messages.append(improvement_message)
                 improved_output = DeveloperOutput(**improvement_message.payload)
@@ -370,19 +378,16 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 )
 
                 try:
-                    apply_response = await client.post(
+                    apply_response = await post_or_raise(
+                        client,
                         f"{REPO_SERVICE_URL}/apply-changes",
-                        json=apply_changes_request.model_dump(),
+                        apply_changes_request.model_dump(),
+                        "Repo apply-changes",
                     )
-                    apply_response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    detail = exc.response.text if exc.response is not None else str(exc)
+                except HTTPException as exc:
                     raise HTTPException(
-                        status_code=502,
-                        detail=(
-                            f"Repo apply-changes failed: {detail}\n"
-                            f"Request: {apply_changes_request.model_dump_json()}"
-                        ),
+                        status_code=exc.status_code,
+                        detail=f"{exc.detail}\nRequest: {apply_changes_request.model_dump_json()}",
                     ) from exc
 
                 applied_changes = ApplyChangesResponse(**apply_response.json())

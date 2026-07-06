@@ -2,18 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-def _looks_like_code(content: str) -> bool:
-    if len(content.strip()) < 20:
-        return False
-
-    if "\n" in content:
-        return True
-
-    code_markers = ["def ", "class ", "import ", "from ", "return ", "if ", "else:", "elif ", "for ", "while "]
-    return any(marker in content for marker in code_markers)
+def _has_meaningful_content(content: str) -> bool:
+    return bool(content and content.strip())
 
 
 class GenerateRequest(BaseModel):
@@ -71,16 +64,35 @@ class PlanningResult(BaseModel):
     requirements: list[str] = Field(default_factory=list)
     implementation_steps: list[str] = Field(default_factory=list)
     likely_modules: list[str] = Field(default_factory=list)
-    likely_files: list[str] = Field(default_factory=list)
+    likely_existing_files: list[str] = Field(default_factory=list)
+    new_files: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     complexity: Literal["Low", "Medium", "High"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_file_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        if "likely_files" in normalized and "likely_existing_files" not in normalized:
+            normalized["likely_existing_files"] = normalized.pop("likely_files")
+
+        normalized.setdefault("new_files", [])
+        return normalized
+
+    @property
+    def likely_files(self) -> list[str]:
+        return list(dict.fromkeys([*self.likely_existing_files, *self.new_files]))
 
 
 class AgentTaskRequest(BaseModel):
     task: str
     ticket: JiraTicket | None = None
     planning_result: PlanningResult | None = None
+    planned_new_files: list[str] = Field(default_factory=list)
     repo_files: list[RepoFile] = Field(default_factory=list)
 
 
@@ -107,9 +119,9 @@ class DeveloperOutput(BaseModel):
                     raise ValueError(
                         f"FileChange content is required for action {change.action} on {change.path}."
                     )
-                if not _looks_like_code(change.content):
+                if not _has_meaningful_content(change.content):
                     raise ValueError(
-                        f"FileChange content for {change.path} does not look like code."
+                        f"FileChange content for {change.path} cannot be empty."
                     )
         return changes
 

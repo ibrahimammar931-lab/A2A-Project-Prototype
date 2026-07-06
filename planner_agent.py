@@ -35,13 +35,16 @@ class PlannerAgent:
     ) -> PlanningResult:
         logger.info("Planner agent planning ticket %s", jira_ticket.key)
         prompt = (
-            "Create an implementation plan for this Jira ticket using only the project knowledge.\n"
+            "Create an implementation plan for this Jira ticket using the project knowledge.\n"
             "Do not generate source code. Do not edit files. Do not review code. Do not call tools.\n"
-            "Choose likely_files from project_knowledge files when possible.\n"
-            "Prefer existing files that already implement related behavior. Do not suggest new files unless the ticket explicitly requires a new file.\n"
-            "For small tickets, choose the smallest likely_files list that can satisfy the change.\n"
+            "Prefer modifying existing files when they already implement the required responsibility.\n"
+            "Suggest creating new files whenever doing so results in a cleaner architecture or is necessary for the feature.\n"
+            "Do not avoid new files simply because they are not present in the project.\n"
+            "Follow the existing project structure and naming conventions when proposing new files.\n"
+            "Never duplicate existing functionality.\n"
+            "If a new file is required, mention it explicitly in implementation_steps.\n"
             "Return only valid JSON with exactly these keys: task_summary, requirements, "
-            "implementation_steps, likely_modules, likely_files, acceptance_criteria, risks, complexity.\n"
+            "implementation_steps, likely_modules, likely_existing_files, new_files, acceptance_criteria, risks, complexity.\n"
             "complexity must be one of: Low, Medium, High.\n\n"
             f"Jira ticket:\n{jira_ticket.model_dump_json(indent=2)}\n\n"
             f"Project knowledge:\n{json.dumps(project_knowledge, indent=2)}"
@@ -71,10 +74,12 @@ class PlannerAgent:
         result = PlanningResult(**data)
         known_files = set((project_knowledge.get("files") or {}).keys())
         if known_files:
-            result.likely_files = [
-                path for path in result.likely_files
+            result.likely_existing_files = [
+                path for path in result.likely_existing_files
                 if path in known_files
             ]
+        result.likely_existing_files = list(dict.fromkeys(result.likely_existing_files))
+        result.new_files = list(dict.fromkeys(result.new_files))
         return result
 
 
