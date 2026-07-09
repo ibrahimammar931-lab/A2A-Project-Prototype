@@ -1,6 +1,8 @@
 # Simple A2A Microservices Prototype
 
-This project is now split into small FastAPI services:
+This project is a small Agent-to-Agent microservices prototype built with FastAPI.
+It separates Jira retrieval, code generation, code review, and workflow orchestration
+into independent services that communicate over HTTP.
 
 - `jira_agent.py` fetches Jira tickets.
 - `knowledge_agent.py` maintains repository knowledge.
@@ -10,7 +12,16 @@ This project is now split into small FastAPI services:
 - `developer_agent.py` generates and improves code.
 - `orchestrator_agent.py` owns the full "work on this ticket" flow.
 
-The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator service coordinates those agents over HTTP.
+## Services
+
+The current version has four services:
+
+```text
+Developer Agent    -> developer_agent.py    -> port 8000
+Jira Agent         -> jira_agent.py         -> port 8001
+Reviewer Agent     -> reviewer_agent.py     -> port 8002
+Orchestrator Agent -> orchestrator_agent.py -> port 8003
+```
 
 ## Project Structure
 
@@ -27,6 +38,7 @@ The Developer agent no longer calls Jira or Reviewer directly. The Orchestrator 
 |-- config.py
 |-- requirements.txt
 |-- .env.example
+|-- SETUP.md
 `-- README.md
 ```
 
@@ -135,14 +147,15 @@ http://127.0.0.1:8003/docs
 Reviewer service docs:
 
 ```text
-http://127.0.0.1:8002/docs
+Client
+  -> Orchestrator Agent
+    -> Jira Agent
+    -> Developer Agent
+    -> Reviewer Agent
+    -> Developer Agent
 ```
 
-Jira service docs:
-
-```text
-http://127.0.0.1:8001/docs
-```
+The services exchange shared Pydantic models from `schemas.py`.
 
 Planner service docs:
 
@@ -179,39 +192,39 @@ Invoke-RestMethod `
   -Body '{"issue_key":"PROJ-123","base_branch":"main"}'
 ```
 
-## Service Responsibilities
+## Service APIs
 
-Jira Service:
+### Orchestrator Agent
+
+```text
+POST /work-on-ticket
+```
+
+Coordinates the full Jira-to-code workflow.
+
+### Jira Agent
 
 ```text
 GET /tickets/{issue_key}
 ```
 
-It calls Jira REST API and returns a clean `JiraTicket`.
+Fetches a Jira issue through Jira REST API and returns a normalized `JiraTicket`.
 
-Reviewer Service:
-
-```text
-POST /review
-```
-
-It receives a JSON agent message with the task, code, and explanation. It returns review feedback as a JSON message.
-
-Developer Service:
+### Developer Agent
 
 ```text
 POST /generate
 POST /improve
 ```
 
-`/generate` only generates code from a task.
+`/generate` creates initial code from a task.
 
-`/improve` improves code using review feedback.
+`/improve` revises code using reviewer feedback.
 
-Orchestrator Service:
+### Reviewer Agent
 
 ```text
-POST /work-on-ticket
+POST /review
 ```
 
 `/work-on-ticket` is the complete flow:
@@ -319,15 +332,31 @@ Invoke-RestMethod `
 }
 ```
 
-## Why This Is Microservices
+## Data Models
 
-Each service has its own FastAPI app and can run on its own port:
+Important shared models live in `schemas.py`:
 
 ```text
-Jira Service       -> port 8001
-Reviewer Service   -> port 8002
-Developer Service  -> port 8000
-Orchestrator       -> port 8003
+GenerateRequest
+GenerateResponse
+JiraTicket
+AgentTaskRequest
+DeveloperOutput
+ReviewFeedback
+AgentMessage
 ```
 
-They communicate using HTTP JSON calls. The Orchestrator service coordinates the workflow, so individual agents keep narrow responsibilities.
+## Responsibility Boundary
+
+The service split is intentional:
+
+```text
+Jira Agent         -> Jira API access and Jira field normalization
+Developer Agent    -> code generation and code improvement only
+Reviewer Agent     -> code review only
+Orchestrator Agent -> workflow coordination only
+```
+
+This keeps the Developer Agent from owning external service calls or workflow state,
+which makes the project easier to extend with repo operations, planner agents,
+retry logic, or parallel review later.
