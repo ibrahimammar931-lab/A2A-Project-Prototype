@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -9,6 +10,7 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_REVIEWER_MODEL = os.getenv("GROQ_REVIEWER_MODEL", "llama-3.3-70b-versatile")
+GROQ_PLANNER_MODEL = os.getenv("GROQ_PLANNER_MODEL", GROQ_MODEL)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
@@ -18,6 +20,13 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 JIRA_SERVICE_URL = os.getenv("JIRA_SERVICE_URL", "http://127.0.0.1:8001")
 REVIEWER_SERVICE_URL = os.getenv("REVIEWER_SERVICE_URL", "http://127.0.0.1:8002")
 DEVELOPER_SERVICE_URL = os.getenv("DEVELOPER_SERVICE_URL", "http://127.0.0.1:8000")
+REPO_SERVICE_URL = os.getenv("REPO_SERVICE_URL", "http://127.0.0.1:8004")
+KNOWLEDGE_SERVICE_URL = os.getenv("KNOWLEDGE_SERVICE_URL", "http://127.0.0.1:8005")
+PLANNER_SERVICE_URL = os.getenv("PLANNER_SERVICE_URL", "http://127.0.0.1:8006")
+
+GITHUB_REPO_URL = os.getenv("GITHUB_REPO_URL")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+REPO_WORKSPACE_ROOT = Path(os.getenv("REPO_WORKSPACE_ROOT", "workspaces"))
 
 
 def check_config() -> None:

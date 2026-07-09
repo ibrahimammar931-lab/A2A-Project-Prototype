@@ -10,12 +10,34 @@ from config import (
     check_config,
     configure_logging,
 )
-from schemas import AgentMessage, ReviewFeedback
+from schemas import AgentMessage, RepoFile, ReviewFeedback
 
 configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Reviewer Agent Service", version="1.0.0")
+
+
+def format_repo_files(repo_files: list[RepoFile]) -> str:
+    if not repo_files:
+        return ""
+
+    formatted_files = []
+    for repo_file in repo_files:
+        formatted_files.append(
+            f"File: {repo_file.path}\n"
+            "```text\n"
+            f"{repo_file.content}\n"
+            "```"
+        )
+
+    return "\n\nRelevant project files:\n\n" + "\n\n".join(formatted_files)
+
+
+def format_diff(diff: str | None) -> str:
+    if not diff:
+        return ""
+    return "\n\nProposed code changes:\n\n" + diff
 
 
 class ReviewerAgent:
@@ -27,16 +49,29 @@ class ReviewerAgent:
             base_url="https://api.groq.com/openai/v1",
         )
 
-    def review_code(self, task: str, code: str, explanation: str) -> ReviewFeedback:
+    def review_code(
+        self,
+        task: str,
+        ticket: dict | None,
+        diff: str | None,
+        explanation: str,
+        repo_files: list[RepoFile] | None = None,
+    ) -> ReviewFeedback:
         logger.info("Reviewer agent reviewing developer output")
         prompt = (
-            "Review the generated code for bugs, missing validation, security issues, "
-            "code quality issues, and best-practice violations.\n"
-            "Return only valid JSON with exactly these keys: approved, issues, "
-            "suggestions, security_notes, quality_notes.\n\n"
+            "You are reviewing a code change for a Jira ticket. Review only the proposed patch and relevant context.\n"
+            "Your job is to judge whether the change satisfies the ticket requirements and whether it introduces bugs or regressions.\n"
+            "Prioritize: missing requirements, functional bugs, security issues, and performance regressions.\n"
+            "Treat style, naming, documentation, refactoring, and extra validation as optional suggestions unless they are required to make the ticket work safely.\n"
+            "Do not request unrelated redesigns or broad refactors.\n"
+            "Return only valid JSON with exactly these keys: approved, decision, summary, issues, suggestions, security_notes, quality_notes, blocking_issues, optional_suggestions, requires_revision, rationale.\n"
+            "The values for issues, suggestions, security_notes, and quality_notes must be arrays of plain strings.\n"
+            "The values for blocking_issues and optional_suggestions must be arrays of objects with category, severity, summary, recommendation, location, and ticket_relevant.\n\n"
             f"Task:\n{task}\n\n"
+            f"Ticket:\n{json.dumps(ticket or {}, indent=2)}\n\n"
             f"Developer explanation:\n{explanation}\n\n"
-            f"Code:\n{code}"
+            f"{format_diff(diff)}"
+            f"{format_repo_files(repo_files or [])}"
         )
 
         response = self.client.chat.completions.create(
@@ -45,9 +80,9 @@ class ReviewerAgent:
                 {
                     "role": "system",
                     "content": (
-                        "You are a strict senior code reviewer. You identify bugs, "
-                        "missing validation, security issues, code quality issues, "
-                        "and best-practice violations. Always respond with strict JSON."
+                        "You are a strict senior code reviewer for a Jira-driven workflow. "
+                        "Judge changes against the ticket requirements, not against personal style preferences. "
+                        "Separate blocking issues from optional suggestions and respond with strict JSON."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -70,8 +105,13 @@ def review(message: AgentMessage) -> AgentMessage:
         reviewer_agent = ReviewerAgent()
         feedback = reviewer_agent.review_code(
             task=message.payload["task"],
-            code=message.payload["code"],
+            ticket=message.payload.get("ticket"),
+            diff=message.payload.get("diff"),
             explanation=message.payload["explanation"],
+            repo_files=[
+                RepoFile(**repo_file)
+                for repo_file in message.payload.get("repo_files", [])
+            ],
         )
         return AgentMessage(
             sender="reviewer_agent",

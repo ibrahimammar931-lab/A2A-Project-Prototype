@@ -14,6 +14,9 @@ from schemas import (
     AgentMessage,
     AgentTaskRequest,
     DeveloperOutput,
+    JiraTicket,
+    PlanningResult,
+    RepoFile,
     ReviewFeedback,
 )
 
@@ -21,6 +24,65 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Developer Agent Service", version="1.0.0")
+
+
+def format_repo_files(repo_files: list[RepoFile]) -> str:
+    if not repo_files:
+        return ""
+
+    formatted_files = []
+    for repo_file in repo_files:
+        formatted_files.append(
+            f"File: {repo_file.path}\n"
+            "```text\n"
+            f"{repo_file.content}\n"
+            "```"
+        )
+
+    return "\n\nExisting project files provided for context:\n\n" + "\n\n".join(formatted_files)
+
+
+def format_ticket(ticket: JiraTicket | None) -> str:
+    if not ticket:
+        return ""
+    return f"\n\nOriginal Jira ticket:\n{ticket.model_dump_json(indent=2)}"
+
+
+def format_plan(planning_result: PlanningResult | None) -> str:
+    if not planning_result:
+        return ""
+    return (
+        "\n\nImplementation plan (guidance, not a restriction):\n"
+        f"{planning_result.model_dump_json(indent=2)}"
+    )
+
+
+def format_likely_modules(planning_result: PlanningResult | None) -> str:
+    if not planning_result or not planning_result.likely_modules:
+        return ""
+
+    modules = "\n".join(f"- {module}" for module in planning_result.likely_modules)
+    return f"\n\nLikely modules:\n{modules}\n"
+
+
+def format_likely_existing_files(planning_result: PlanningResult | None) -> str:
+    if not planning_result or not planning_result.likely_existing_files:
+        return ""
+
+    paths = "\n".join(f"- {path}" for path in planning_result.likely_existing_files)
+    return f"\n\nLikely existing files to inspect:\n{paths}\n"
+
+
+def format_planned_new_files(planned_new_files: list[str] | None) -> str:
+    if not planned_new_files:
+        return ""
+
+    paths = "\n".join(f"- {path}" for path in planned_new_files)
+    return (
+        "\n\nPlanner-requested new files:\n"
+        f"{paths}\n"
+        "If these files are necessary to satisfy the ticket, create them.\n"
+    )
 
 
 class DeveloperAgent:
@@ -32,13 +94,33 @@ class DeveloperAgent:
             base_url="https://api.groq.com/openai/v1",
         )
 
-    def generate_code(self, task: str) -> DeveloperOutput:
+    def generate_code(
+        self,
+        task: str,
+        ticket: JiraTicket | None = None,
+        planning_result: PlanningResult | None = None,
+        planned_new_files: list[str] | None = None,
+        repo_files: list[RepoFile] | None = None,
+    ) -> DeveloperOutput:
         logger.info("Developer agent generating initial code")
         prompt = (
-            "Generate production-minded Python code for this task.\n"
-            "Return only valid JSON with exactly these keys: code, explanation.\n"
+            "Implement the ticket requirements with the smallest possible change set.\n"
+            "Focus only on the requested behavior and preserve the existing application structure.\n"
+            "Do not refactor unrelated code, add broad validation, or redesign the architecture.\n"
+            "The implementation plan is guidance, not a restriction.\n"
+            "You may create additional source files if they are necessary to implement the Jira ticket correctly and follow the project's architecture.\n"
+            "Do not limit yourself only to the files listed by the Planner.\n"
+            f"{format_planned_new_files(planned_new_files)}"
+            "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
+            "The changes value must be a list of objects with path, action, and content.\n"
+            "Each change.content must be the full file contents after the edit, not a summary.\n"
             "Do not wrap the JSON in Markdown.\n\n"
             f"Task: {task}"
+            f"{format_ticket(ticket)}"
+            f"{format_likely_modules(planning_result)}"
+            f"{format_likely_existing_files(planning_result)}"
+            f"{format_plan(planning_result)}"
+            f"{format_repo_files(repo_files or [])}"
         )
         return self._ask_groq(prompt)
 
@@ -47,15 +129,33 @@ class DeveloperAgent:
         task: str,
         original_code: str,
         review_feedback: ReviewFeedback,
+        ticket: JiraTicket | None = None,
+        planning_result: PlanningResult | None = None,
+        planned_new_files: list[str] | None = None,
+        repo_files: list[RepoFile] | None = None,
     ) -> DeveloperOutput:
         logger.info("Developer agent improving code from review feedback")
         prompt = (
-            "Improve the code using the reviewer feedback.\n"
-            "Return only valid JSON with exactly these keys: code, explanation.\n"
+            "Revise the previous implementation in response to review feedback.\n"
+            "Preserve all previously completed ticket functionality. Do not remove or regress existing behavior.\n"
+            "Only address blocking issues from the review feedback. Ignore optional suggestions and style-only feedback.\n"
+            "Do not refactor unrelated code or change the core design.\n"
+            "The implementation plan is guidance, not a restriction.\n"
+            "You may create additional source files if they are necessary to implement the Jira ticket correctly and follow the project's architecture.\n"
+            "Do not limit yourself only to the files listed by the Planner.\n"
+            f"{format_planned_new_files(planned_new_files)}"
+            "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
+            "The changes value must be a list of objects with path, action, and content.\n"
+            "Each change.content must be the full file contents after the edit, not a summary.\n"
             "Do not wrap the JSON in Markdown.\n\n"
             f"Original task:\n{task}\n\n"
+            f"{format_ticket(ticket)}"
             f"Original code:\n{original_code}\n\n"
             f"Reviewer feedback JSON:\n{review_feedback.model_dump_json(indent=2)}"
+            f"{format_likely_modules(planning_result)}"
+            f"{format_likely_existing_files(planning_result)}"
+            f"{format_plan(planning_result)}"
+            f"{format_repo_files(repo_files or [])}"
         )
         return self._ask_groq(prompt)
 
@@ -66,8 +166,9 @@ class DeveloperAgent:
                 {
                     "role": "system",
                     "content": (
-                        "You are a senior developer agent. You write clean, secure, "
-                        "well explained code and always respond with strict JSON."
+                        "You are a senior developer agent for a Jira-driven workflow. "
+                        "Implement the ticket requirements precisely and preserve existing behavior. "
+                        "Respond with strict JSON only."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -88,7 +189,13 @@ class DeveloperAgent:
 def generate_code(request: AgentTaskRequest) -> DeveloperOutput:
     try:
         developer_agent = DeveloperAgent()
-        return developer_agent.generate_code(request.task)
+        return developer_agent.generate_code(
+            request.task,
+            request.ticket,
+            request.planning_result,
+            request.planned_new_files,
+            request.repo_files,
+        )
     except ValueError as exc:
         logger.warning("Developer output validation failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -106,6 +213,21 @@ def improve_code(message: AgentMessage) -> AgentMessage:
             task=message.payload["task"],
             original_code=message.payload["original_code"],
             review_feedback=review_feedback,
+            ticket=(
+                JiraTicket(**message.payload["ticket"])
+                if message.payload.get("ticket")
+                else None
+            ),
+            planning_result=(
+                PlanningResult(**message.payload["planning_result"])
+                if message.payload.get("planning_result")
+                else None
+            ),
+            planned_new_files=message.payload.get("planned_new_files", []),
+            repo_files=[
+                RepoFile(**repo_file)
+                for repo_file in message.payload.get("repo_files", [])
+            ],
         )
         return AgentMessage(
             sender="developer_agent",
