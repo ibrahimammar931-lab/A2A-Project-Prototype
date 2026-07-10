@@ -1,0 +1,34 @@
+<mat-toolbar color="primary" class="app-toolbar">
+  <mat-icon class="toolbar-icon">dashboard</mat-icon>
+  <span class="toolbar-title">{{ title() }}</span>
+  <span class="toolbar-spacer"></span>
+
+  <app-pipeline-controls></app-pipeline-controls>
+</mat-toolbar>
+
+<!-- Workflow Launcher Section -->
+<div class="launcher-section">
+  <app-workflow-launcher></app-workflow-launcher>
+</div>
+
+<!-- Main Dashboard Grid -->
+<div class="dashboard-grid">
+  <!-- Left Panel: Agent List -->
+  <div class="panel panel-left">
+    <app-agent-list
+      [agents]="agents"
+      [selectedAgentId]="selectedAgent?.id ?? null"
+      (agentSelected)="onAgentSelected($event)"
+    ></app-agent-list>
+  </div>
+
+  <!-- Center Panel: Agent Details -->
+  <div class="panel panel-center">
+    <app-agent-detail [agent]="selectedAgent"></app-agent-detail>
+  </div>
+
+  <!-- Right Panel: Log Console -->
+  <div class="panel panel-right">
+    <app-log-console [logs]="logs"></app-log-console>
+  </div>
+</div>

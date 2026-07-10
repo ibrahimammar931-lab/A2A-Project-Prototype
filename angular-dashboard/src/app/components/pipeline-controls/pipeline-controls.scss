@@ -1,0 +1,37 @@
+.controls-container {
+  display: flex;
+  gap: 8px;
+  padding: 8px 16px;
+}
+
+.control-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85rem;
+  border-radius: 20px;
+  padding: 2px 16px;
+  min-width: 90px;
+  justify-content: center;
+
+  mat-icon {
+    font-size: 18px;
+    width: 18px;
+    height: 18px;
+  }
+}
+
+.pause-btn {
+  color: #ffa726;
+  border-color: #ffa726;
+}
+
+.resume-btn {
+  color: #66bb6a;
+  border-color: #66bb6a;
+}
+
+.stop-btn {
+  color: #ef5350;
+  border-color: #ef5350;
+}
