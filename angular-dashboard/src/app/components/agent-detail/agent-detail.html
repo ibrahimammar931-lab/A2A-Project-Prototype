@@ -35,6 +35,14 @@
       <span class="detail-label">Duration</span>
       <span class="detail-value">{{ agent.duration || '—' }}</span>
     </div>
+
+    <div *ngIf="errorMessage" class="error-section">
+      <mat-divider></mat-divider>
+      <div class="error-message">
+        <mat-icon class="error-icon">error_outline</mat-icon>
+        <span>{{ errorMessage }}</span>
+      </div>
+    </div>
   </mat-card-content>
 </mat-card>
 

@@ -7,6 +7,7 @@ export interface Agent {
   startTime: string | null;
   endTime: string | null;
   duration: string | null;
+  errorMessage?: string | null;
 }
 
 export const DEFAULT_AGENTS: Agent[] = [

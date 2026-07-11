@@ -55,6 +55,30 @@
   color: rgba(255, 255, 255, 0.87);
 }
 
+.error-section {
+  margin-top: 8px;
+}
+
+.error-message {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin-top: 8px;
+  background: rgba(244, 67, 54, 0.1);
+  border-radius: 6px;
+  color: #ef5350;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.error-icon {
+  font-size: 18px;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
 .no-selection {
   display: flex;
   flex-direction: column;

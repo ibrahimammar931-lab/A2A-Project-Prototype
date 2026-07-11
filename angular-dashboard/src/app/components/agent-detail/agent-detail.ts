@@ -14,6 +14,7 @@ import { Agent, AgentStatus } from '../../models/agent.model';
 })
 export class AgentDetailComponent {
   @Input() agent: Agent | null = null;
+  @Input() errorMessage: string | null = null;
 
   getStatusIcon(status: AgentStatus): string {
     const icons: Record<AgentStatus, string> = {
@@ -28,7 +29,7 @@ export class AgentDetailComponent {
   getStatusColor(status: AgentStatus): string {
     const colors: Record<AgentStatus, string> = {
       waiting: '#9e9e9e',
-      running: '#2196f3',
+      running: '#ffa726',
       completed: '#4caf50',
       failed: '#f44336',
     };

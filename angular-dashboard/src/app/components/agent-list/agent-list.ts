@@ -29,7 +29,7 @@ export class AgentListComponent {
   getStatusColor(status: AgentStatus): string {
     const colors: Record<AgentStatus, string> = {
       waiting: '#9e9e9e',
-      running: '#2196f3',
+      running: '#ffa726',
       completed: '#4caf50',
       failed: '#f44336',
     };
