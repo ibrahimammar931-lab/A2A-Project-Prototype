@@ -1,9 +1,14 @@
 import json
 import logging
+import os
+import time
+import uuid
 from difflib import unified_diff
+from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
 from config import (
     DEVELOPER_SERVICE_URL,
@@ -45,6 +50,13 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Orchestrator Agent Service", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:4200", "http://localhost:4200"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 async def post_or_raise(
@@ -142,6 +154,617 @@ def validate_planned_changes(output: DeveloperOutput, repo_files: list) -> None:
             "Developer attempted to change files outside the Planner-selected files. "
             f"Unexpected: {unexpected}. Allowed: {allowed}."
         )
+
+
+class ManualWorkflowController:
+    def __init__(self) -> None:
+        self.issue_key = os.getenv("DEFAULT_ISSUE_KEY", "A2A-184")
+        self.base_branch = os.getenv("DEFAULT_BASE_BRANCH", "main")
+        self.status = "waiting"
+        self.current_action = "Ready to start manual workflow."
+        self.running_agent = "None"
+        self.started_at: float | None = None
+        self.step_index = 0
+        self.previous_agent = "None"
+        self.current_agent = "Jira"
+        self.next_agent = "Repository"
+        self.context: dict[str, Any] = {}
+        self.agents = self._initial_agents()
+        self.messages: list[dict[str, Any]] = []
+        self.active_path: list[str] = []
+        self.clients: set[WebSocket] = set()
+        self.lock = None
+
+    @property
+    def steps(self) -> list[dict[str, str]]:
+        return [
+            {"id": "jira", "name": "Jira"},
+            {"id": "repo-initial", "name": "Repository"},
+            {"id": "knowledge", "name": "Knowledge"},
+            {"id": "planner", "name": "Planner"},
+            {"id": "developer", "name": "Developer"},
+            {"id": "reviewer", "name": "Reviewer"},
+            {"id": "repo-final", "name": "Repository"},
+        ]
+
+    def _initial_agents(self) -> dict[str, dict[str, Any]]:
+        now = self._now()
+        definitions = [
+            ("jira", "Jira"),
+            ("orchestrator", "Orchestrator"),
+            ("repo-initial", "Repo"),
+            ("knowledge", "Knowledge"),
+            ("planner", "Planner"),
+            ("developer", "Developer"),
+            ("reviewer", "Reviewer"),
+            ("repo-final", "Repo"),
+        ]
+        return {
+            agent_id: {
+                "id": agent_id,
+                "name": name,
+                "status": "waiting",
+                "executionState": "Waiting",
+                "startTime": None,
+                "endTime": None,
+                "duration": "00:00:00",
+                "currentAction": "Waiting",
+                "executionCount": 0,
+                "lastExecution": "Never",
+                "messagesSent": 0,
+                "messagesReceived": 0,
+                "files": {"read": [], "modified": [], "created": []},
+                "output": {},
+                "errors": [],
+            }
+            for agent_id, name in definitions
+        } | {
+            "orchestrator": {
+                "id": "orchestrator",
+                "name": "Orchestrator",
+                "status": "success",
+                "executionState": "Manual control ready",
+                "startTime": now,
+                "endTime": None,
+                "duration": "00:00:00",
+                "currentAction": "Manual control ready",
+                "executionCount": 0,
+                "lastExecution": now,
+                "messagesSent": 0,
+                "messagesReceived": 0,
+                "files": {"read": [], "modified": [], "created": []},
+                "output": {"mode": "manual"},
+                "errors": [],
+            }
+        }
+
+    def reset(self, issue_key: str | None = None, base_branch: str | None = None) -> None:
+        self.issue_key = issue_key or self.issue_key
+        self.base_branch = base_branch or self.base_branch
+        self.status = "waiting"
+        self.current_action = "Workflow started in manual mode. Jira is waiting for approval."
+        self.running_agent = "None"
+        self.started_at = time.time()
+        self.step_index = 0
+        self.previous_agent = "None"
+        self.current_agent = "Jira"
+        self.next_agent = "Repository"
+        self.context = {}
+        self.agents = self._initial_agents()
+        self.messages = []
+        self.active_path = []
+
+    async def run_next(self) -> None:
+        if self.status in {"failed", "completed"}:
+            return
+        if self.step_index >= len(self.steps):
+            self.status = "completed"
+            self.current_action = "Workflow completed."
+            self.running_agent = "None"
+            return
+
+        step = self.steps[self.step_index]
+        agent = self.agents[step["id"]]
+        self.status = "running"
+        self.running_agent = step["name"]
+        self.current_agent = step["name"]
+        self.current_action = f"Running {step['name']}"
+        self._mark_agent(step["id"], "running", self.current_action)
+        await self.broadcast()
+
+        started = time.time()
+        try:
+            await getattr(self, f"_run_{step['id'].replace('-', '_')}")()
+            duration = self._duration(started)
+            self._mark_agent(step["id"], "success", "Completed", duration=duration)
+            if step["id"] not in self.active_path:
+                self.active_path.append(step["id"])
+            self.previous_agent = step["name"]
+            self.step_index += 1
+            if self.step_index >= len(self.steps):
+                self.status = "completed"
+                self.current_agent = "None"
+                self.next_agent = "None"
+                self.running_agent = "None"
+                self.current_action = "Workflow completed."
+            else:
+                next_step = self.steps[self.step_index]
+                self.status = "waiting"
+                self.current_agent = next_step["name"]
+                self.next_agent = self.steps[self.step_index + 1]["name"] if self.step_index + 1 < len(self.steps) else "None"
+                self.running_agent = "None"
+                self.current_action = f"{step['name']} completed. {next_step['name']} is waiting for approval."
+        except Exception as exc:
+            logger.exception("Manual workflow step failed")
+            self.status = "failed"
+            self.running_agent = "None"
+            self.current_action = str(exc)
+            self._mark_agent(step["id"], "failed", "Failed", error=str(exc))
+        await self.broadcast()
+
+    async def _run_jira(self) -> None:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.get(f"{JIRA_SERVICE_URL}/tickets/{self.issue_key}")
+            response.raise_for_status()
+            ticket = JiraTicket(**response.json())
+        self.context["ticket"] = ticket
+        self.context["task"] = ticket_to_task(ticket)
+        self.agents["jira"]["output"] = ticket.model_dump()
+
+    async def _run_repo_initial(self) -> None:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await post_or_raise(
+                client,
+                f"{REPO_SERVICE_URL}/prepare-repo",
+                PrepareRepoRequest().model_dump(),
+                "Repo prepare",
+            )
+        repo = RepoInfo(**response.json())
+        self.context["repo"] = repo
+        self.agents["repo-initial"]["output"] = repo.model_dump()
+        self._add_message("Orchestrator", "Repo", "repo.prepared", repo.model_dump(), "delivered")
+
+    async def _run_knowledge(self) -> None:
+        repo: RepoInfo = self.context["repo"]
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await post_or_raise(
+                client,
+                f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
+                {"repository_path": repo.path},
+                "Knowledge ensure",
+            )
+        knowledge = response.json()
+        self.context["knowledge"] = knowledge
+        self.agents["knowledge"]["output"] = knowledge
+        self._add_message("Knowledge", "Planner", "context.ready", knowledge, "delivered")
+
+    async def _run_planner(self) -> None:
+        ticket: JiraTicket = self.context["ticket"]
+        knowledge: dict[str, Any] = self.context["knowledge"]
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await post_or_raise(
+                client,
+                f"{PLANNER_SERVICE_URL}/plan",
+                PlanningRequest(jira_ticket=ticket, project_knowledge=knowledge).model_dump(),
+                "Planner plan",
+            )
+        planning_result = PlanningResult(**response.json())
+        self.context["planning_result"] = planning_result
+        payload = planning_result.model_dump()
+        self.agents["planner"]["status"] = "requires-revision"
+        self.agents["planner"]["output"] = payload
+        self._add_message("Planner", "Developer", "planning.completed", payload, "pending-approval")
+
+    async def _run_developer(self) -> None:
+        ticket: JiraTicket = self.context["ticket"]
+        repo: RepoInfo = self.context["repo"]
+        planning_result = self._current_planning_result()
+        planned_existing_files = list(dict.fromkeys(planning_result.likely_existing_files))
+        planned_new_files = list(dict.fromkeys(planning_result.new_files))
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            branch_response = await post_or_raise(
+                client,
+                f"{REPO_SERVICE_URL}/create-branch",
+                CreateBranchRequest(
+                    repo_url=repo.remote_url,
+                    issue_key=ticket.key,
+                    title=ticket.summary,
+                    base_branch=self.base_branch,
+                ).model_dump(),
+                "Repo create-branch",
+            )
+            branch = BranchResponse(**branch_response.json())
+            self.context["branch"] = branch
+
+            repo_files = []
+            if planned_existing_files:
+                files_response = await post_or_raise(
+                    client,
+                    f"{REPO_SERVICE_URL}/read-files",
+                    ReadFilesRequest(repo_url=repo.remote_url, paths=planned_existing_files).model_dump(),
+                    "Repo read-files",
+                )
+                repo_files = ReadFilesResponse(**files_response.json()).files
+            self.context["repo_files"] = repo_files
+
+            generation_response = await post_or_raise(
+                client,
+                f"{DEVELOPER_SERVICE_URL}/generate",
+                AgentTaskRequest(
+                    task=self.context["task"],
+                    ticket=ticket,
+                    planning_result=planning_result,
+                    likely_modules=list(dict.fromkeys(planning_result.likely_modules)),
+                    likely_existing_files=planned_existing_files,
+                    planned_new_files=planned_new_files,
+                    repo_files=repo_files,
+                ).model_dump(),
+                "Developer generate",
+            )
+        output = DeveloperOutput(**generation_response.json())
+        validate_planned_changes(output, self.context["repo_files"])
+        self.context["developer_output"] = output
+        self.agents["developer"]["output"] = output.model_dump()
+        self.agents["developer"]["files"] = {
+            "read": [repo_file.path for repo_file in self.context["repo_files"]],
+            "modified": [change.path for change in output.changes if change.action.lower() in {"update", "upsert"}],
+            "created": [change.path for change in output.changes if change.action.lower() == "create"],
+        }
+        self._add_message("Developer", "Reviewer", "code.review.request", self._review_payload(), "pending-approval")
+
+    async def _run_reviewer(self) -> None:
+        review_payload = self._latest_payload("Developer", "Reviewer") or self._review_payload()
+        review_request = AgentMessage(
+            sender="orchestrator_agent",
+            receiver="reviewer_agent",
+            message_type="code_review_request",
+            payload=review_payload,
+        )
+        async with httpx.AsyncClient(timeout=60) as client:
+            reviewer_response = await post_or_raise(
+                client,
+                f"{REVIEWER_SERVICE_URL}/review",
+                review_request.model_dump(),
+                "Reviewer review",
+            )
+        review_response = AgentMessage(**reviewer_response.json())
+        feedback = ReviewFeedback(**review_response.payload)
+        self.context["review_feedback"] = feedback
+        self.agents["reviewer"]["output"] = feedback.model_dump()
+        status = "requires-revision" if feedback.requires_revision else "success"
+        self.agents["reviewer"]["status"] = status
+        self._add_message("Reviewer", "Repo", "review.completed", feedback.model_dump(), "pending-approval")
+
+    async def _run_repo_final(self) -> None:
+        ticket: JiraTicket = self.context["ticket"]
+        repo: RepoInfo = self.context["repo"]
+        branch: BranchResponse = self.context["branch"]
+        output: DeveloperOutput = self.context["developer_output"]
+        applied_changes = None
+        pull_request = None
+        async with httpx.AsyncClient(timeout=60) as client:
+            if output.changes:
+                apply_request = ApplyChangesRequest(
+                    repo_url=repo.remote_url,
+                    changes=[change.model_dump() for change in output.changes],
+                    branch=branch.branch,
+                    commit_message=f"{ticket.key} {ticket.summary}",
+                )
+                apply_response = await post_or_raise(
+                    client,
+                    f"{REPO_SERVICE_URL}/apply-changes",
+                    apply_request.model_dump(),
+                    "Repo apply-changes",
+                )
+                applied_changes = ApplyChangesResponse(**apply_response.json())
+                await post_or_raise(
+                    client,
+                    f"{KNOWLEDGE_SERVICE_URL}/update-knowledge",
+                    {"repository_path": repo.path, "changes": [change.model_dump() for change in output.changes]},
+                    "Knowledge update",
+                )
+                pr_response = await post_or_raise(
+                    client,
+                    f"{REPO_SERVICE_URL}/open-pr",
+                    PullRequestRequest(
+                        repo_url=repo.remote_url,
+                        issue_key=ticket.key,
+                        title=ticket.summary,
+                        summary=ticket.description or "Pull request created by orchestrator.",
+                        base_branch=self.base_branch,
+                        head_branch=branch.branch,
+                        ticket_url=ticket.url,
+                    ).model_dump(),
+                    "Repo open-pr",
+                )
+                pull_request = PullRequestResponse(**pr_response.json())
+        output_payload = {
+            "commits": applied_changes.commit_shas if applied_changes else [],
+            "changed_files": applied_changes.changed_files if applied_changes else [],
+            "pr_url": pull_request.url if pull_request else None,
+        }
+        self.agents["repo-final"]["output"] = output_payload
+        self.agents["repo-final"]["files"] = {
+            "read": [],
+            "modified": output_payload["changed_files"],
+            "created": [],
+        }
+        self._add_message("Repo", "Orchestrator", "repo.completed", output_payload, "delivered")
+
+    def _review_payload(self) -> dict[str, Any]:
+        ticket: JiraTicket = self.context["ticket"]
+        planning_result = self._current_planning_result()
+        output: DeveloperOutput = self.context["developer_output"]
+        repo_files = self.context.get("repo_files", [])
+        return {
+            "task": self.context["task"],
+            "ticket": ticket.model_dump(),
+            "planning_result": planning_result.model_dump(),
+            "diff": build_review_diff([change.model_dump() for change in output.changes], repo_files),
+            "changes": [change.model_dump() for change in output.changes],
+            "explanation": output.explanation,
+            "repo_files": [repo_file.model_dump() for repo_file in repo_files],
+        }
+
+    def _current_planning_result(self) -> PlanningResult:
+        payload = self._latest_payload("Planner", "Developer")
+        if payload:
+            return PlanningResult(**payload)
+        return self.context["planning_result"]
+
+    def _latest_payload(self, sender: str, receiver: str) -> dict[str, Any] | None:
+        for message in reversed(self.messages):
+            if message["sender"] == sender and message["receiver"] == receiver:
+                return message.get("editedPayload") or message["payload"]
+        return None
+
+    def save_edited_message(self, message_id: str, payload: dict[str, Any], description: str) -> None:
+        for message in self.messages:
+            if message["id"] == message_id:
+                message["editedPayload"] = payload
+                message["status"] = "pending-approval"
+                message["userChanges"].append({
+                    "time": self._now(),
+                    "author": "Dashboard operator",
+                    "description": description,
+                })
+                return
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    def send_edited_message(self, message_id: str) -> None:
+        for message in self.messages:
+            if message["id"] == message_id:
+                message["payload"] = message.get("editedPayload") or message["payload"]
+                message["status"] = "sent"
+                return
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    def skip_agent(self) -> None:
+        if self.step_index >= len(self.steps):
+            return
+        step = self.steps[self.step_index]
+        self._mark_agent(step["id"], "success", "Skipped by operator")
+        self.previous_agent = step["name"]
+        self.step_index += 1
+        self.status = "waiting"
+        self.current_action = f"{step['name']} skipped by operator."
+        if self.step_index < len(self.steps):
+            self.current_agent = self.steps[self.step_index]["name"]
+            self.next_agent = self.steps[self.step_index + 1]["name"] if self.step_index + 1 < len(self.steps) else "None"
+        else:
+            self.status = "completed"
+
+    def snapshot(self) -> dict[str, Any]:
+        elapsed = self._duration(self.started_at) if self.started_at else "00:00:00"
+        repo = self.context.get("repo")
+        branch = self.context.get("branch")
+        return {
+            "summary": {
+                "status": self._dashboard_status(),
+                "ticket": self.issue_key,
+                "branch": branch.branch if branch else self.base_branch,
+                "repository": repo.remote_url if repo else os.getenv("GITHUB_REPO_URL", "Not prepared"),
+                "runningAgent": self.running_agent,
+                "currentAction": self.current_action,
+                "totalExecutionTime": elapsed,
+                "progress": round((self.step_index / len(self.steps)) * 100),
+                "manualMode": True,
+                "previousAgent": self.previous_agent,
+                "currentAgent": self.current_agent,
+                "nextAgent": self.next_agent,
+            },
+            "agents": list(self.agents.values()),
+            "messages": self.messages,
+            "activePath": ["orchestrator", *self.active_path],
+        }
+
+    async def broadcast(self) -> None:
+        if not self.clients:
+            return
+        snapshot = self.snapshot()
+        disconnected: list[WebSocket] = []
+        for websocket in self.clients:
+            try:
+                await websocket.send_json(snapshot)
+            except Exception:
+                disconnected.append(websocket)
+        for websocket in disconnected:
+            self.clients.discard(websocket)
+
+    def _dashboard_status(self) -> str:
+        if self.status == "revision":
+            return "requires-revision"
+        return self.status
+
+    def _add_message(self, sender: str, receiver: str, message_type: str, payload: dict[str, Any], status: str) -> None:
+        now = self._now()
+        self.messages.append({
+            "id": f"msg-{uuid.uuid4().hex[:10]}",
+            "time": now,
+            "sender": sender,
+            "receiver": receiver,
+            "type": message_type,
+            "status": status,
+            "duration": "00:00",
+            "summary": message_type.replace(".", " ").title(),
+            "payload": payload,
+            "userChanges": [],
+        })
+        for agent in self.agents.values():
+            if agent["name"] == sender:
+                agent["messagesSent"] += 1
+            if agent["name"] == receiver:
+                agent["messagesReceived"] += 1
+
+    def _mark_agent(self, agent_id: str, status: str, action: str, duration: str | None = None, error: str | None = None) -> None:
+        agent = self.agents[agent_id]
+        now = self._now()
+        if status == "running":
+            agent["startTime"] = now
+            agent["executionCount"] += 1
+        if status in {"success", "failed"}:
+            agent["endTime"] = now
+            agent["lastExecution"] = now
+        agent["status"] = status
+        agent["executionState"] = action
+        agent["currentAction"] = action
+        if duration:
+            agent["duration"] = duration
+        if error:
+            agent["errors"].append(error)
+
+    def _duration(self, started: float | None) -> str:
+        if not started:
+            return "00:00:00"
+        seconds = int(time.time() - started)
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+    def _now(self) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+manual_workflow = ManualWorkflowController()
+
+
+def command_result(command: str) -> dict[str, Any]:
+    return {"command": command, "accepted": True, "timestamp": manual_workflow._now()}
+
+
+@app.get("/api/workflow/state")
+async def workflow_state() -> dict[str, Any]:
+    return manual_workflow.snapshot()
+
+
+@app.websocket("/ws/workflow")
+async def workflow_socket(websocket: WebSocket) -> None:
+    await websocket.accept()
+    manual_workflow.clients.add(websocket)
+    await websocket.send_json(manual_workflow.snapshot())
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manual_workflow.clients.discard(websocket)
+
+
+@app.post("/api/workflow/start")
+async def workflow_start(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    manual_workflow.reset(
+        issue_key=payload.get("issue_key") or payload.get("ticket"),
+        base_branch=payload.get("base_branch") or payload.get("branch"),
+    )
+    await manual_workflow.broadcast()
+    return command_result("start")
+
+
+@app.post("/api/workflow/run-next-agent")
+async def workflow_run_next() -> dict[str, Any]:
+    await manual_workflow.run_next()
+    return command_result("run-next-agent")
+
+
+@app.post("/api/workflow/pause")
+async def workflow_pause() -> dict[str, Any]:
+    manual_workflow.status = "paused"
+    manual_workflow.running_agent = "None"
+    manual_workflow.current_action = "Workflow paused by dashboard operator."
+    await manual_workflow.broadcast()
+    return command_result("pause")
+
+
+@app.post("/api/workflow/resume")
+async def workflow_resume() -> dict[str, Any]:
+    manual_workflow.status = "waiting"
+    manual_workflow.current_action = f"{manual_workflow.current_agent} is waiting for approval."
+    await manual_workflow.broadcast()
+    return command_result("resume")
+
+
+@app.post("/api/workflow/stop")
+async def workflow_stop() -> dict[str, Any]:
+    manual_workflow.status = "failed"
+    manual_workflow.running_agent = "None"
+    manual_workflow.current_action = "Workflow stopped by dashboard operator."
+    await manual_workflow.broadcast()
+    return command_result("stop")
+
+
+@app.post("/api/workflow/restart")
+async def workflow_restart(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    manual_workflow.reset(
+        issue_key=payload.get("issue_key") or manual_workflow.issue_key,
+        base_branch=payload.get("base_branch") or manual_workflow.base_branch,
+    )
+    await manual_workflow.broadcast()
+    return command_result("restart")
+
+
+@app.post("/api/workflow/rerun-current-agent")
+async def workflow_rerun_current() -> dict[str, Any]:
+    await manual_workflow.run_next()
+    return command_result("rerun-current-agent")
+
+
+@app.post("/api/workflow/skip-agent")
+async def workflow_skip_agent() -> dict[str, Any]:
+    manual_workflow.skip_agent()
+    await manual_workflow.broadcast()
+    return command_result("skip-agent")
+
+
+@app.post("/api/workflow/cancel")
+async def workflow_cancel() -> dict[str, Any]:
+    manual_workflow.status = "failed"
+    manual_workflow.running_agent = "None"
+    manual_workflow.current_action = "Workflow cancelled by dashboard operator."
+    await manual_workflow.broadcast()
+    return command_result("cancel")
+
+
+@app.post("/api/workflow/export-log")
+async def workflow_export_log() -> dict[str, Any]:
+    return manual_workflow.snapshot()
+
+
+@app.post("/api/workflow/save-edited-message")
+async def workflow_save_edited_message(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    manual_workflow.save_edited_message(
+        message_id=payload["messageId"],
+        payload=payload["editedPayload"],
+        description=payload.get("description") or "Edited message payload",
+    )
+    await manual_workflow.broadcast()
+    return command_result("save-edited-message")
+
+
+@app.post("/api/workflow/send-edited-message")
+async def workflow_send_edited_message(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    manual_workflow.send_edited_message(payload["messageId"])
+    await manual_workflow.broadcast()
+    return command_result("send-edited-message")
 
 
 @app.post("/work-on-ticket", response_model=GenerateResponse)

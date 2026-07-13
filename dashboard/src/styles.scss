@@ -1,0 +1,81 @@
+@use '@angular/material' as mat;
+
+html {
+  color-scheme: dark;
+  @include mat.theme((
+    color: mat.$azure-palette,
+    typography: Inter,
+    density: -1
+  ));
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    linear-gradient(180deg, rgba(17, 24, 39, 0.94), rgba(3, 7, 18, 1)),
+    radial-gradient(circle at 50% 0%, rgba(20, 184, 166, 0.12), transparent 30%);
+  color: #e5eefc;
+  font-family: Inter, Roboto, Arial, sans-serif;
+}
+
+button, input, textarea, select {
+  font-family: inherit;
+}
+
+.mat-mdc-snack-bar-container .mdc-snackbar__surface {
+  background: #111827;
+  color: #e5eefc;
+}
+
+mat-icon,
+.mat-icon {
+  font-family: 'Material Icons Round' !important;
+  font-weight: normal;
+  font-style: normal;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  font-feature-settings: 'liga';
+  -webkit-font-feature-settings: 'liga';
+  -webkit-font-smoothing: antialiased;
+}
+
+.json-block {
+  margin: 0;
+  overflow: auto;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 8px;
+  background: #07111f;
+  color: #b7f7d0;
+  font: 500 12px/1.6 'Roboto Mono', monospace;
+  padding: 14px;
+  white-space: pre-wrap;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.state-waiting { color: #cbd5e1; background: rgba(148, 163, 184, 0.16); }
+.state-running { color: #bfdbfe; background: rgba(37, 99, 235, 0.22); }
+.state-success, .state-completed { color: #bbf7d0; background: rgba(34, 197, 94, 0.18); }
+.state-requires-revision { color: #fed7aa; background: rgba(249, 115, 22, 0.2); }
+.state-failed { color: #fecaca; background: rgba(239, 68, 68, 0.22); }
+.state-paused { color: #fde68a; background: rgba(234, 179, 8, 0.18); }
