@@ -71,9 +71,6 @@ import { WorkflowStatus } from '../../models/workflow.models';
   `,
   styles: [`
     .control-bar {
-      position: sticky;
-      top: 64px;
-      z-index: 15;
       display: grid;
       gap: 14px;
       padding: 16px 22px;
@@ -139,7 +136,6 @@ import { WorkflowStatus } from '../../models/workflow.models';
 
     @media (max-width: 720px) {
       .control-bar {
-        top: 121px;
         padding: 12px;
       }
 
