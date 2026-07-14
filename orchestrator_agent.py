@@ -312,6 +312,7 @@ class ManualWorkflowController:
         self.agents["jira"]["output"] = ticket.model_dump()
 
     async def _run_repo_initial(self) -> None:
+        ticket: JiraTicket = self.context["ticket"]
         async with httpx.AsyncClient(timeout=60) as client:
             response = await post_or_raise(
                 client,
@@ -319,10 +320,28 @@ class ManualWorkflowController:
                 PrepareRepoRequest().model_dump(),
                 "Repo prepare",
             )
-        repo = RepoInfo(**response.json())
+            repo = RepoInfo(**response.json())
+
+            branch_response = await post_or_raise(
+                client,
+                f"{REPO_SERVICE_URL}/create-branch",
+                CreateBranchRequest(
+                    repo_url=repo.remote_url,
+                    issue_key=ticket.key,
+                    title=ticket.summary,
+                    base_branch=self.base_branch,
+                ).model_dump(),
+                "Repo create-branch",
+            )
+        branch = BranchResponse(**branch_response.json())
         self.context["repo"] = repo
-        self.agents["repo-initial"]["output"] = repo.model_dump()
+        self.context["branch"] = branch
+        self.agents["repo-initial"]["output"] = {
+            "repo": repo.model_dump(),
+            "branch": branch.model_dump(),
+        }
         self._add_message("Orchestrator", "Repo", "repo.prepared", repo.model_dump(), "delivered")
+        self._add_message("Orchestrator", "Repo", "repo.branch_created", branch.model_dump(), "delivered")
 
     async def _run_knowledge(self) -> None:
         repo: RepoInfo = self.context["repo"]
@@ -363,20 +382,6 @@ class ManualWorkflowController:
         planned_new_files = list(dict.fromkeys(planning_result.new_files))
 
         async with httpx.AsyncClient(timeout=60) as client:
-            branch_response = await post_or_raise(
-                client,
-                f"{REPO_SERVICE_URL}/create-branch",
-                CreateBranchRequest(
-                    repo_url=repo.remote_url,
-                    issue_key=ticket.key,
-                    title=ticket.summary,
-                    base_branch=self.base_branch,
-                ).model_dump(),
-                "Repo create-branch",
-            )
-            branch = BranchResponse(**branch_response.json())
-            self.context["branch"] = branch
-
             repo_files = []
             if planned_existing_files:
                 files_response = await post_or_raise(
@@ -801,6 +806,27 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 )
             )
 
+            branch_response = await post_or_raise(
+                client,
+                f"{REPO_SERVICE_URL}/create-branch",
+                CreateBranchRequest(
+                    repo_url=repo.remote_url,
+                    issue_key=ticket.key,
+                    title=ticket.summary,
+                    base_branch=request.base_branch,
+                ).model_dump(),
+                "Repo create-branch",
+            )
+            branch = BranchResponse(**branch_response.json())
+            messages.append(
+                AgentMessage(
+                    sender="orchestrator_agent",
+                    receiver="repo_agent",
+                    message_type="repo_branch_created",
+                    payload=branch.model_dump(),
+                )
+            )
+
             knowledge_response = await post_or_raise(
                 client,
                 f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
@@ -838,27 +864,6 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
 
             planned_existing_files = list(dict.fromkeys(planning_result.likely_existing_files))
             planned_new_files = list(dict.fromkeys(planning_result.new_files))
-
-            branch_response = await post_or_raise(
-                client,
-                f"{REPO_SERVICE_URL}/create-branch",
-                CreateBranchRequest(
-                    repo_url=repo.remote_url,
-                    issue_key=ticket.key,
-                    title=ticket.summary,
-                    base_branch=request.base_branch,
-                ).model_dump(),
-                "Repo create-branch",
-            )
-            branch = BranchResponse(**branch_response.json())
-            messages.append(
-                AgentMessage(
-                    sender="orchestrator_agent",
-                    receiver="repo_agent",
-                    message_type="repo_branch_created",
-                    payload=branch.model_dump(),
-                )
-            )
 
             if planned_existing_files:
                 files_response = await post_or_raise(
