@@ -203,9 +203,8 @@ export class PipelineGraphComponent implements AfterViewInit, OnDestroy {
           }
         },
         {
-          selector: '.active-path',
+          selector: 'edge.active-path',
           style: {
-            'border-color': '#67e8f9',
             'line-color': '#67e8f9',
             'target-arrow-color': '#67e8f9',
             width: 5,
@@ -213,7 +212,14 @@ export class PipelineGraphComponent implements AfterViewInit, OnDestroy {
           }
         },
         {
-          selector: '.active-node',
+          selector: 'node.active-path',
+          style: {
+            'border-color': '#67e8f9',
+            'z-index': 10
+          }
+        },
+        {
+          selector: 'node.active-node',
           style: {
             'border-color': '#fef08a',
             'border-width': 5,
@@ -221,7 +227,7 @@ export class PipelineGraphComponent implements AfterViewInit, OnDestroy {
           } as unknown as cytoscape.Css.Node
         },
         {
-          selector: '.selected-node',
+          selector: 'node.selected-node',
           style: {
             'border-color': '#ffffff',
             'border-width': 5,
