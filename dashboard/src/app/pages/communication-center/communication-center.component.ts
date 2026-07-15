@@ -150,6 +150,11 @@ import { MessageEditorComponent } from '../../components/message-editor/message-
       align-items: start;
     }
 
+    .content > * {
+      min-width: 0;
+      overflow: hidden;
+    }
+
     .route {
       display: inline-flex;
       align-items: center;

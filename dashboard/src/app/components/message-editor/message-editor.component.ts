@@ -8,11 +8,12 @@ import { MatStepperModule } from '@angular/material/stepper';
 import { MatListModule } from '@angular/material/list';
 import { WorkflowStateService } from '../../services/workflow-state.service';
 import { JsonViewerComponent } from '../json-viewer/json-viewer.component';
+import { StructuredJsonEditorComponent } from '../structured-json-editor/structured-json-editor.component';
 
 @Component({
   selector: 'app-message-editor',
   standalone: true,
-  imports: [FormsModule, MatButtonModule, MatIconModule, MatFormFieldModule, MatInputModule, MatStepperModule, MatListModule, JsonViewerComponent],
+  imports: [FormsModule, MatButtonModule, MatIconModule, MatFormFieldModule, MatInputModule, MatStepperModule, MatListModule, JsonViewerComponent, StructuredJsonEditorComponent],
   template: `
     @if (message(); as message) {
       <section class="editor">
@@ -38,10 +39,10 @@ import { JsonViewerComponent } from '../json-viewer/json-viewer.component';
           </div>
           <div>
             <h3>Edited Message</h3>
-            <mat-form-field appearance="outline">
-              <mat-label>Payload JSON</mat-label>
-              <textarea matInput rows="18" [(ngModel)]="draft"></textarea>
-            </mat-form-field>
+            <app-structured-json-editor
+              [value]="draftObject()"
+              (valueChange)="onDraftChanged($event)"
+            />
           </div>
         </div>
 
@@ -91,6 +92,7 @@ import { JsonViewerComponent } from '../json-viewer/json-viewer.component';
       border: 1px solid rgba(148, 163, 184, 0.18);
       border-radius: 8px;
       background: rgba(15, 23, 42, 0.68);
+      min-width: 0;
     }
 
     header, .buttons {
@@ -132,6 +134,11 @@ import { JsonViewerComponent } from '../json-viewer/json-viewer.component';
       gap: 16px;
     }
 
+    .compare > div {
+      min-width: 0;
+      overflow: hidden;
+    }
+
     mat-form-field {
       width: 100%;
     }
@@ -140,6 +147,8 @@ import { JsonViewerComponent } from '../json-viewer/json-viewer.component';
       font-family: 'Roboto Mono', monospace;
       font-size: 12px;
       line-height: 1.5;
+      max-height: 500px;
+      overflow-y: auto;
     }
 
     .history p {
@@ -157,7 +166,7 @@ import { JsonViewerComponent } from '../json-viewer/json-viewer.component';
 export class MessageEditorComponent {
   private readonly workflow = inject(WorkflowStateService);
   readonly message = this.workflow.selectedMessage;
-  readonly draftSignal = signal('');
+  readonly draftSignal = signal<unknown>(null);
   readonly changeSignal = signal('Edited message payload');
   readonly stepIndex = computed(() => {
     const status = this.message()?.status;
@@ -173,18 +182,17 @@ export class MessageEditorComponent {
     return 0;
   });
 
-  get draft(): string {
+  readonly draftObject = computed(() => {
     const message = this.message();
     const current = this.draftSignal();
-    if (!current && message) {
-      return JSON.stringify(message.editedPayload ?? message.payload, null, 2);
+    if (current !== null) {
+      return current;
     }
-    return current;
-  }
-
-  set draft(value: string) {
-    this.draftSignal.set(value);
-  }
+    if (message) {
+      return message.editedPayload ?? message.payload;
+    }
+    return null;
+  });
 
   get changeSummary(): string {
     return this.changeSignal();
@@ -194,10 +202,14 @@ export class MessageEditorComponent {
     this.changeSignal.set(value);
   }
 
+  onDraftChanged(edited: unknown): void {
+    this.draftSignal.set(edited);
+  }
+
   save(messageId: string): void {
-    const parsed = this.parseDraft();
-    if (parsed.ok) {
-      this.workflow.saveEditedMessage(messageId, parsed.value, this.changeSummary || 'Edited message payload');
+    const edited = this.draftSignal();
+    if (edited !== null) {
+      this.workflow.saveEditedMessage(messageId, edited, this.changeSummary || 'Edited message payload');
     }
   }
 
@@ -206,15 +218,6 @@ export class MessageEditorComponent {
   }
 
   reset(payload: unknown): void {
-    this.draftSignal.set(JSON.stringify(payload, null, 2));
-  }
-
-  private parseDraft(): { ok: true; value: unknown } | { ok: false } {
-    try {
-      return { ok: true, value: JSON.parse(this.draft) };
-    } catch {
-      this.changeSignal.set('Draft contains invalid JSON');
-      return { ok: false };
-    }
+    this.draftSignal.set(structuredClone(payload));
   }
 }
