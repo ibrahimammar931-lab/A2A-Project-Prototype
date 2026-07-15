@@ -20,8 +20,8 @@ function isArray(value: unknown): value is unknown[] {
   return Array.isArray(value);
 }
 
-function sortedKeys(obj: JsonObject): string[] {
-  return Object.keys(obj).sort();
+function orderedKeys(obj: JsonObject): string[] {
+  return Object.keys(obj);
 }
 
 function isEmptyString(value: unknown): boolean {
@@ -95,9 +95,9 @@ function setByPath(obj: Record<string, unknown>, path: string, value: unknown): 
         <!-- opening brace -->
         <span class="sje-brace">{{ '{' }}</span>
 
-        <ng-container *ngIf="sortedKeys(node).length > 0; else emptyObj">
+        <ng-container *ngIf="orderedKeys(node).length > 0; else emptyObj">
           <br />
-          <ng-container *ngFor="let key of sortedKeys(node); let last = last">
+          <ng-container *ngFor="let key of orderedKeys(node); let last = last">
             <span class="sje-indent" [style.paddingLeft.px]="(depth + 1) * 20"></span
             ><span class="sje-key">"{{ key }}"</span
             ><span class="sje-colon">: </span
@@ -396,7 +396,7 @@ export class StructuredJsonEditorComponent {
     return t === 'string' || t === 'number' || t === 'boolean';
   }
 
-  sortedKeys = sortedKeys;
+  orderedKeys = orderedKeys;
 
   joinPath(parent: string, key: string): string {
     return parent ? `${parent}.${key}` : key;

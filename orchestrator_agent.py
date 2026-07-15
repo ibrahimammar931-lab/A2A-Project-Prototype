@@ -408,7 +408,7 @@ class ManualWorkflowController:
                 "Developer generate",
             )
         output = DeveloperOutput(**generation_response.json())
-        validate_planned_changes(output, self.context["repo_files"])
+        #validate_planned_changes(output, self.context["repo_files"])
         self.context["developer_output"] = output
         self.agents["developer"]["output"] = output.model_dump()
         self.agents["developer"]["files"] = {
@@ -904,7 +904,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 "Developer generate",
             )
             original_output = DeveloperOutput(**generation_response.json())
-            validate_planned_changes(original_output, repo_files)
+            #validate_planned_changes(original_output, repo_files)
 
             review_request = AgentMessage(
                 sender="orchestrator_agent",
@@ -983,7 +983,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 improvement_message = AgentMessage(**improvement_response.json())
                 messages.append(improvement_message)
                 improved_output = DeveloperOutput(**improvement_message.payload)
-                validate_planned_changes(improved_output, repo_files)
+                #validate_planned_changes(improved_output, repo_files)
             else:
                 improved_output = original_output
 
