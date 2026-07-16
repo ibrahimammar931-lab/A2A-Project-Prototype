@@ -574,7 +574,7 @@ class ManualWorkflowController:
                 "currentAction": self.current_action,
                 "totalExecutionTime": elapsed,
                 "progress": round((self.step_index / len(self.steps)) * 100),
-                "manualMode": True,
+                "manualMode": current_mode == "manual",
                 "previousAgent": self.previous_agent,
                 "currentAgent": self.current_agent,
                 "nextAgent": self.next_agent,
@@ -652,6 +652,7 @@ class ManualWorkflowController:
 
 
 manual_workflow = ManualWorkflowController()
+current_mode: str = "manual"  # "manual" or "automatic"
 
 
 def command_result(command: str) -> dict[str, Any]:
@@ -675,6 +676,36 @@ async def workflow_socket(websocket: WebSocket) -> None:
         manual_workflow.clients.discard(websocket)
 
 
+@app.post("/api/workflow/set-mode")
+async def workflow_set_mode(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    global current_mode
+    new_mode = str(payload.get("mode", "manual")).lower()
+    if new_mode not in {"manual", "automatic"}:
+        raise HTTPException(status_code=400, detail="Mode must be 'manual' or 'automatic'")
+    current_mode = new_mode
+    manual_workflow.current_action = f"Mode switched to {new_mode}."
+    await manual_workflow.broadcast()
+    return {"command": "set-mode", "accepted": True, "mode": current_mode, "timestamp": manual_workflow._now()}
+
+
+@app.get("/api/workflow/mode")
+async def workflow_get_mode() -> dict[str, Any]:
+    return {"mode": current_mode}
+
+
+async def _run_automatic_workflow() -> None:
+    """Runs all workflow steps sequentially without waiting for manual approval."""
+    manual_workflow.current_action = "Automatic workflow running..."
+    manual_workflow.status = "running"
+    await manual_workflow.broadcast()
+    while manual_workflow.status not in {"failed", "completed"} and manual_workflow.step_index < len(manual_workflow.steps):
+        await manual_workflow.run_next()
+        if manual_workflow.status == "waiting":
+            # In auto mode, don't wait - just continue to the next step
+            manual_workflow.status = "running"
+    await manual_workflow.broadcast()
+
+
 @app.post("/api/workflow/start")
 async def workflow_start(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     manual_workflow.reset(
@@ -682,6 +713,8 @@ async def workflow_start(payload: dict[str, Any] = Body(default_factory=dict)) -
         base_branch=payload.get("base_branch") or payload.get("branch"),
     )
     await manual_workflow.broadcast()
+    if current_mode == "automatic":
+        await _run_automatic_workflow()
     return command_result("start")
 
 

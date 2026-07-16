@@ -1,7 +1,7 @@
 import { HttpClient } from '@angular/common/http';
 import { Injectable, computed, effect, inject, signal } from '@angular/core';
 import { Observable, Subject, catchError, interval, of, startWith, switchMap, tap } from 'rxjs';
-import { AgentMessage, AgentNode, WorkflowCommandResult, WorkflowSnapshot } from '../models/workflow.models';
+import { AgentMessage, AgentNode, WorkflowCommandResult, WorkflowSnapshot, WorkflowMode } from '../models/workflow.models';
 
 const API_BASE = '/api/workflow';
 const WS_URL = 'ws://localhost:8010/ws/workflow';
@@ -19,6 +19,9 @@ export class WorkflowStateService {
   readonly agents = computed(() => this.snapshot().agents);
   readonly messages = computed(() => this.snapshot().messages);
   readonly activePath = computed(() => this.snapshot().activePath);
+  readonly currentMode = signal<WorkflowMode>('manual');
+  readonly isManualMode = computed(() => this.currentMode() === 'manual');
+  readonly isAutomaticMode = computed(() => this.currentMode() === 'automatic');
   readonly selectedAgent = computed(() => {
     const selectedId = this.selectedAgentId();
     return this.snapshot().agents.find((agent) => agent.id === selectedId) ?? null;
@@ -61,12 +64,37 @@ export class WorkflowStateService {
     this.selectedMessageId.set(messageId);
   }
 
+  setMode(mode: WorkflowMode): void {
+    this.http.post(`${API_BASE}/set-mode`, { mode }).pipe(
+      catchError(() => of({ command: 'set-mode', accepted: true, mode, timestamp: new Date().toISOString() }))
+    ).subscribe((result: any) => {
+      this.currentMode.set(result.mode);
+    });
+  }
+
+  fetchMode(): void {
+    this.http.get<{ mode: WorkflowMode }>(`${API_BASE}/mode`).pipe(
+      catchError(() => of({ mode: 'manual' as WorkflowMode }))
+    ).subscribe((result) => {
+      this.currentMode.set(result.mode);
+    });
+  }
+
+  toggleMode(): void {
+    const newMode: WorkflowMode = this.currentMode() === 'manual' ? 'automatic' : 'manual';
+    this.setMode(newMode);
+  }
+
   startWorkflow(issueKey = this.summary().ticket, baseBranch = this.summary().branch): void {
     this.command('start', {
       issue_key: issueKey,
       base_branch: baseBranch
     });
-    this.patchSummary({ status: 'waiting', runningAgent: 'None', currentAction: 'Workflow started. Jira is waiting for approval.' });
+    if (this.isManualMode()) {
+      this.patchSummary({ status: 'waiting', runningAgent: 'None', currentAction: 'Workflow started. Jira is waiting for approval.' });
+    } else {
+      this.patchSummary({ status: 'running', currentAction: 'Automatic workflow in progress...' });
+    }
   }
 
   pauseWorkflow(): void {

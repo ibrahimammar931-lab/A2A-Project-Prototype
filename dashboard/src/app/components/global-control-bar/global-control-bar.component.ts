@@ -1,6 +1,7 @@
 import { Component, computed, inject } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MatButtonModule } from '@angular/material/button';
+import { MatButtonToggleModule } from '@angular/material/button-toggle';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatIconModule } from '@angular/material/icon';
 import { MatInputModule } from '@angular/material/input';
@@ -12,7 +13,7 @@ import { WorkflowStatus } from '../../models/workflow.models';
 @Component({
   selector: 'app-global-control-bar',
   standalone: true,
-  imports: [FormsModule, MatButtonModule, MatFormFieldModule, MatIconModule, MatInputModule, MatProgressBarModule, MatTooltipModule],
+  imports: [FormsModule, MatButtonModule, MatButtonToggleModule, MatFormFieldModule, MatIconModule, MatInputModule, MatProgressBarModule, MatTooltipModule],
   template: `
     <section class="control-bar">
       <div class="summary-line">
@@ -26,6 +27,10 @@ import { WorkflowStatus } from '../../models/workflow.models';
         <div class="metric"><span>Running Agent</span><strong>{{ summary().runningAgent }}</strong></div>
         <div class="metric wide"><span>Current Action</span><strong>{{ summary().currentAction }}</strong></div>
         <div class="metric"><span>Total Time</span><strong>{{ summary().totalExecutionTime }}</strong></div>
+        <div class="metric mode-indicator" [class.manual]="workflow.isManualMode()" [class.automatic]="workflow.isAutomaticMode()">
+          <span>Mode</span>
+          <strong>{{ workflow.isManualMode() ? '🔧 Manual' : '🤖 Automatic' }}</strong>
+        </div>
       </div>
 
       <div class="start-inputs">
@@ -40,6 +45,17 @@ import { WorkflowStatus } from '../../models/workflow.models';
       </div>
 
       <div class="actions">
+        <mat-button-toggle-group [value]="workflow.currentMode()" (change)="onModeToggle($event)" hideSingleSelectionIndicator="true">
+          <mat-button-toggle value="manual" matTooltip="Each agent requires approval before running">
+            <mat-icon>touch_app</mat-icon>
+            Manual
+          </mat-button-toggle>
+          <mat-button-toggle value="automatic" matTooltip="Workflow runs automatically without requiring approval">
+            <mat-icon>auto_mode</mat-icon>
+            Automatic
+          </mat-button-toggle>
+        </mat-button-toggle-group>
+
         <button mat-flat-button color="primary" (click)="startWorkflow()">
           <mat-icon>play_arrow</mat-icon>
           Start Workflow
@@ -130,6 +146,16 @@ import { WorkflowStatus } from '../../models/workflow.models';
       border: 1px solid currentColor;
     }
 
+    .mode-indicator.manual {
+      border-color: rgba(251, 191, 36, 0.4);
+      background: rgba(251, 191, 36, 0.08);
+    }
+
+    .mode-indicator.automatic {
+      border-color: rgba(34, 197, 94, 0.4);
+      background: rgba(34, 197, 94, 0.08);
+    }
+
     button mat-icon {
       margin-right: 6px;
     }
@@ -159,6 +185,11 @@ export class GlobalControlBarComponent {
 
   label(value: string): string {
     return value.split('-').map((part) => part[0].toUpperCase() + part.slice(1)).join(' ');
+  }
+
+  onModeToggle(event: any): void {
+    const newMode = event.value;
+    this.workflow.setMode(newMode);
   }
 
   startWorkflow(): void {

@@ -1,4 +1,5 @@
 export type WorkflowStatus = 'running' | 'waiting' | 'paused' | 'failed' | 'completed' | 'requires-revision';
+export type WorkflowMode = 'manual' | 'automatic';
 export type AgentStatus = 'waiting' | 'running' | 'success' | 'requires-revision' | 'failed';
 export type MessageStatus = 'queued' | 'pending-approval' | 'sent' | 'delivered' | 'edited' | 'failed';
 

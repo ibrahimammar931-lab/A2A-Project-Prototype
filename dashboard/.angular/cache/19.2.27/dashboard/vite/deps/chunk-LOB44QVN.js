@@ -1,23 +1,23 @@
 import {
-  RtlScrollAxisType,
-  getRtlScrollAxisType,
-  supportsScrollBehavior
-} from "./chunk-2O4WY5GE.js";
-import {
   ArrayDataSource,
   _RecycleViewRepeaterStrategy,
   _VIEW_REPEATER_STRATEGY,
   isDataSource
 } from "./chunk-OE47J7N6.js";
 import {
-  BidiModule,
-  Directionality
-} from "./chunk-KQLRACRO.js";
+  RtlScrollAxisType,
+  getRtlScrollAxisType,
+  supportsScrollBehavior
+} from "./chunk-2O4WY5GE.js";
 import {
   Platform,
   coerceElement,
   coerceNumberProperty
-} from "./chunk-MKZ6QWCC.js";
+} from "./chunk-UMCZFHBK.js";
+import {
+  BidiModule,
+  Directionality
+} from "./chunk-KQLRACRO.js";
 import {
   DOCUMENT
 } from "./chunk-SWT3FLHJ.js";
@@ -1563,4 +1563,4 @@ export {
   CdkScrollableModule,
   ScrollingModule
 };
-//# sourceMappingURL=chunk-SIPR6XLN.js.map
+//# sourceMappingURL=chunk-LOB44QVN.js.map
