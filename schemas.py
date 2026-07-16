@@ -20,6 +20,7 @@ class GenerateRequest(BaseModel):
     base_branch: str = ""
     existing_branch: str = ""
     open_pr: bool = True
+    repo_url: str = ""
 
     @model_validator(mode="after")
     def validate_branch_exclusivity(self):

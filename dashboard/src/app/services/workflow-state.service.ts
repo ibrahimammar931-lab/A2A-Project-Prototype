@@ -89,13 +89,15 @@ export class WorkflowStateService {
     issueKey = this.summary().ticket,
     baseBranch = this.summary().branch,
     existingBranch = '',
-    openPr = true
+    openPr = true,
+    repoUrl = ''
   ): void {
     this.command('start', {
       issue_key: issueKey,
       base_branch: baseBranch,
       existing_branch: existingBranch,
-      open_pr: openPr
+      open_pr: openPr,
+      repo_url: repoUrl
     });
     if (this.isManualMode()) {
       this.patchSummary({ status: 'waiting', runningAgent: 'None', currentAction: 'Workflow started. Jira is waiting for approval.' });
@@ -119,12 +121,13 @@ export class WorkflowStateService {
     this.patchSummary({ status: 'failed', currentAction: 'Workflow stopped' });
   }
 
-  restartWorkflow(existingBranch = '', openPr = true): void {
+  restartWorkflow(existingBranch = '', openPr = true, repoUrl = ''): void {
     this.command('restart', {
       issue_key: this.summary().ticket,
       base_branch: this.summary().branch,
       existing_branch: existingBranch,
-      open_pr: openPr
+      open_pr: openPr,
+      repo_url: repoUrl
     });
     this.snapshot.set(createMockSnapshot());
   }

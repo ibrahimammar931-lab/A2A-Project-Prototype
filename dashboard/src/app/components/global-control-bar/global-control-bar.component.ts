@@ -47,6 +47,10 @@ import { WorkflowStatus } from '../../models/workflow.models';
           <mat-label>Existing Branch</mat-label>
           <input matInput [(ngModel)]="workflowExistingBranch" placeholder="feature/my-branch">
         </mat-form-field>
+        <mat-form-field appearance="outline">
+          <mat-label>Repo URL</mat-label>
+          <input matInput [(ngModel)]="workflowRepoUrl" placeholder="https://github.com/owner/repo">
+        </mat-form-field>
       </div>
 
       <div class="actions">
@@ -106,7 +110,7 @@ import { WorkflowStatus } from '../../models/workflow.models';
 
     .start-inputs {
       display: grid;
-      grid-template-columns: minmax(180px, 260px) minmax(180px, 260px) minmax(180px, 260px);
+      grid-template-columns: minmax(180px, 260px) minmax(180px, 260px) minmax(180px, 260px) minmax(180px, 260px);
       gap: 10px;
       align-items: start;
     }
@@ -184,6 +188,7 @@ export class GlobalControlBarComponent {
   workflowTicket = localStorage.getItem('workflowTicket') ?? '';
   workflowBranch = localStorage.getItem('workflowBranch') ?? '';
   workflowExistingBranch = localStorage.getItem('workflowExistingBranch') ?? '';
+  workflowRepoUrl = localStorage.getItem('workflowRepoUrl') ?? '';
   workflowOpenPr = localStorage.getItem('workflowOpenPr') !== 'false';
 
   label(value: string): string {
@@ -200,11 +205,13 @@ export class GlobalControlBarComponent {
     const branch = this.workflowBranch.trim() || 'main';
     const existingBranch = this.workflowExistingBranch.trim();
     const openPr = this.workflowOpenPr;
+    const repoUrl = this.workflowRepoUrl.trim();
     localStorage.setItem('workflowTicket', ticket);
     localStorage.setItem('workflowBranch', branch);
     localStorage.setItem('workflowExistingBranch', existingBranch);
     localStorage.setItem('workflowOpenPr', String(openPr));
-    this.workflow.startWorkflow(ticket, branch, existingBranch, openPr);
+    localStorage.setItem('workflowRepoUrl', repoUrl);
+    this.workflow.startWorkflow(ticket, branch, existingBranch, openPr, repoUrl);
   }
 }
 

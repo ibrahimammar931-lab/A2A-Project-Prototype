@@ -164,6 +164,7 @@ class ManualWorkflowController:
         self.base_branch = self.default_base_branch
         self.existing_branch = ""
         self.open_pr = True
+        self.repo_url = ""
         self.status = "waiting"
         self.current_action = "Ready to start manual workflow."
         self.running_agent = "None"
@@ -258,6 +259,7 @@ class ManualWorkflowController:
         base_branch: str | None = None,
         existing_branch: str | None = None,
         open_pr: bool | None = None,
+        repo_url: str | None = None,
     ) -> None:
         # Validate mutual exclusivity based ONLY on what was explicitly passed
         # into *this* call. Checking against the merged/fallback state (the
@@ -298,6 +300,7 @@ class ManualWorkflowController:
         self.base_branch = base_branch if base_branch is not None else self.base_branch
         self.existing_branch = existing_branch if existing_branch is not None else self.existing_branch
         self.open_pr = open_pr if open_pr is not None else self.open_pr
+        self.repo_url = repo_url if repo_url is not None else self.repo_url
         self.status = "waiting"
         self.current_action = "Workflow started in manual mode. Jira is waiting for approval."
         self.running_agent = "None"
@@ -397,7 +400,7 @@ class ManualWorkflowController:
             response = await post_or_raise(
                 client,
                 f"{REPO_SERVICE_URL}/prepare-repo",
-                PrepareRepoRequest().model_dump(),
+                PrepareRepoRequest(repo_url=self.repo_url or None).model_dump(),
                 "Repo prepare",
             )
             repo = RepoInfo(**response.json())
@@ -760,7 +763,7 @@ class ManualWorkflowController:
                 "status": self._dashboard_status(),
                 "ticket": self.issue_key,
                 "branch": branch.branch if branch else (self.existing_branch or self.base_branch or self.default_base_branch),
-                "repository": repo.remote_url if repo else os.getenv("GITHUB_REPO_URL", "Not prepared"),
+                "repository": repo.remote_url if repo else (self.repo_url or os.getenv("GITHUB_REPO_URL", "Not prepared")),
                 "runningAgent": self.running_agent,
                 "currentAction": self.current_action,
                 "totalExecutionTime": elapsed,
@@ -927,6 +930,7 @@ async def workflow_start(payload: dict[str, Any] = Body(default_factory=dict)) -
         base_branch=_first_provided(payload, "base_branch", "branch"),
         existing_branch=payload.get("existing_branch"),
         open_pr=payload.get("open_pr"),
+        repo_url=payload.get("repo_url"),
     )
     await manual_workflow.broadcast()
     if current_mode == "automatic":
@@ -1048,7 +1052,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
             repo_response = await post_or_raise(
                 client,
                 f"{REPO_SERVICE_URL}/prepare-repo",
-                PrepareRepoRequest().model_dump(),
+                PrepareRepoRequest(repo_url=request.repo_url or None).model_dump(),
                 "Repo prepare",
             )
             repo = RepoInfo(**repo_response.json())
