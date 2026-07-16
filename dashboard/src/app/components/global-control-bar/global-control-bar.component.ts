@@ -60,14 +60,6 @@ import { WorkflowStatus } from '../../models/workflow.models';
           <mat-icon>play_arrow</mat-icon>
           Start Workflow
         </button>
-        <button mat-stroked-button (click)="workflow.pauseWorkflow()">
-          <mat-icon>pause</mat-icon>
-          Pause
-        </button>
-        <button mat-stroked-button (click)="workflow.resumeWorkflow()">
-          <mat-icon>play_arrow</mat-icon>
-          Resume
-        </button>
         <button mat-stroked-button (click)="workflow.stopWorkflow()">
           <mat-icon>stop</mat-icon>
           Stop
@@ -180,8 +172,8 @@ export class GlobalControlBarComponent {
   readonly summary = this.workflow.summary;
   readonly statusClass = computed(() => `state-${this.summary().status}`);
   readonly statusIcon = computed(() => statusIcon(this.summary().status));
-  workflowTicket = this.summary().ticket;
-  workflowBranch = this.summary().branch || 'main';
+  workflowTicket = localStorage.getItem('workflowTicket') ?? '';
+  workflowBranch = localStorage.getItem('workflowBranch') ?? '';
 
   label(value: string): string {
     return value.split('-').map((part) => part[0].toUpperCase() + part.slice(1)).join(' ');
@@ -193,7 +185,11 @@ export class GlobalControlBarComponent {
   }
 
   startWorkflow(): void {
-    this.workflow.startWorkflow(this.workflowTicket.trim(), this.workflowBranch.trim() || 'main');
+    const ticket = this.workflowTicket.trim();
+    const branch = this.workflowBranch.trim() || 'main';
+    localStorage.setItem('workflowTicket', ticket);
+    localStorage.setItem('workflowBranch', branch);
+    this.workflow.startWorkflow(ticket, branch);
   }
 }
 

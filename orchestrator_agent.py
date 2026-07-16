@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -174,6 +175,7 @@ class ManualWorkflowController:
         self.active_path: list[str] = []
         self.clients: set[WebSocket] = set()
         self.lock = None
+        self.current_task: asyncio.Task | None = None
 
     @property
     def steps(self) -> list[dict[str, str]]:
@@ -184,8 +186,17 @@ class ManualWorkflowController:
             {"id": "planner", "name": "Planner"},
             {"id": "developer", "name": "Developer"},
             {"id": "reviewer", "name": "Reviewer"},
+            {"id": "developer-improve", "name": "Developer"},
             {"id": "repo-final", "name": "Repository"},
         ]
+
+    def _agent_id_for_step(self, step_id: str) -> str:
+        # Steps that represent a re-run of an existing agent card map back to
+        # the original agent id so the dashboard updates the same card instead
+        # of spawning a duplicate.
+        return {
+            "developer-improve": "developer",
+        }.get(step_id, step_id)
 
     def _initial_agents(self) -> dict[str, dict[str, Any]]:
         now = self._now()
@@ -253,6 +264,17 @@ class ManualWorkflowController:
         self.agents = self._initial_agents()
         self.messages = []
         self.active_path = []
+        self.current_task = None
+
+    def request_stop(self, reason: str) -> None:
+        """Interrupts whatever step is currently executing, if any, and marks
+        the workflow as failed/stopped. Safe to call whether or not a step is
+        actually mid-execution."""
+        self.status = "failed"
+        self.running_agent = "None"
+        self.current_action = reason
+        if self.current_task is not None and not self.current_task.done():
+            self.current_task.cancel()
 
     async def run_next(self) -> None:
         if self.status in {"failed", "completed"}:
@@ -264,7 +286,8 @@ class ManualWorkflowController:
             return
 
         step = self.steps[self.step_index]
-        agent = self.agents[step["id"]]
+        agent_id = self._agent_id_for_step(step["id"])
+        agent = self.agents[agent_id]
         self.status = "running"
         self.running_agent = step["name"]
         self.current_agent = step["name"]
@@ -273,12 +296,15 @@ class ManualWorkflowController:
         await self.broadcast()
 
         started = time.time()
+        handler = getattr(self, f"_run_{step['id'].replace('-', '_')}")
+        task = asyncio.ensure_future(handler())
+        self.current_task = task
         try:
-            await getattr(self, f"_run_{step['id'].replace('-', '_')}")()
+            await task
             duration = self._duration(started)
             self._mark_agent(step["id"], "success", "Completed", duration=duration)
-            if step["id"] not in self.active_path:
-                self.active_path.append(step["id"])
+            if agent_id not in self.active_path:
+                self.active_path.append(agent_id)
             self.previous_agent = step["name"]
             self.step_index += 1
             if self.step_index >= len(self.steps):
@@ -294,12 +320,20 @@ class ManualWorkflowController:
                 self.next_agent = self.steps[self.step_index + 1]["name"] if self.step_index + 1 < len(self.steps) else "None"
                 self.running_agent = "None"
                 self.current_action = f"{step['name']} completed. {next_step['name']} is waiting for approval."
+        except asyncio.CancelledError:
+            logger.warning("Manual workflow step '%s' was cancelled by operator", step["id"])
+            self.status = "failed"
+            self.running_agent = "None"
+            self.current_action = f"{step['name']} was cancelled by operator."
+            self._mark_agent(step["id"], "failed", "Cancelled by operator", error="Cancelled by operator")
         except Exception as exc:
             logger.exception("Manual workflow step failed")
             self.status = "failed"
             self.running_agent = "None"
             self.current_action = str(exc)
             self._mark_agent(step["id"], "failed", "Failed", error=str(exc))
+        finally:
+            self.current_task = None
         await self.broadcast()
 
     async def _run_jira(self) -> None:
@@ -441,6 +475,82 @@ class ManualWorkflowController:
         self.agents["reviewer"]["status"] = status
         self._add_message("Reviewer", "Repo", "review.completed", feedback.model_dump(), "pending-approval")
 
+    async def _run_developer_improve(self) -> None:
+        feedback: ReviewFeedback = self.context["review_feedback"]
+        should_regenerate = bool(feedback.requires_revision and feedback.blocking_issues)
+
+        if not should_regenerate:
+            self.agents["developer"]["output"] = {
+                "skipped": True,
+                "reason": "No blocking issues reported by Reviewer.",
+            }
+            self._add_message(
+                "Reviewer",
+                "Developer",
+                "code.improvement_skipped",
+                {"reason": "No blocking issues reported by Reviewer."},
+                "delivered",
+            )
+            return
+
+        ticket: JiraTicket = self.context["ticket"]
+        planning_result = self._current_planning_result()
+        planned_existing_files = list(dict.fromkeys(planning_result.likely_existing_files))
+        planned_new_files = list(dict.fromkeys(planning_result.new_files))
+        repo_files = self.context.get("repo_files", [])
+        original_output: DeveloperOutput = self.context["developer_output"]
+
+        filtered_feedback = ReviewFeedback(
+            approved=False,
+            decision="request_changes",
+            summary="Address the blocking issues below while preserving the completed ticket behavior.",
+            issues=[issue.summary for issue in feedback.blocking_issues],
+            suggestions=[issue.recommendation for issue in feedback.blocking_issues],
+            security_notes=[issue.summary for issue in feedback.blocking_issues if issue.category == "security"],
+            quality_notes=[issue.summary for issue in feedback.blocking_issues if issue.category in {"bug", "performance", "missing_requirement"}],
+            blocking_issues=feedback.blocking_issues,
+            optional_suggestions=[],
+            requires_revision=True,
+            rationale="Only blocking issues were forwarded for revision.",
+        )
+
+        improvement_request = AgentMessage(
+            sender="orchestrator_agent",
+            receiver="developer_agent",
+            message_type="code_improvement_request",
+            payload={
+                "task": self.context["task"],
+                "ticket": ticket.model_dump(),
+                "planning_result": planning_result.model_dump(),
+                "likely_modules": list(dict.fromkeys(planning_result.likely_modules)),
+                "likely_existing_files": planned_existing_files,
+                "original_code": original_output.code,
+                "planned_new_files": planned_new_files,
+                "review_feedback": filtered_feedback.model_dump(),
+                "repo_files": [repo_file.model_dump() for repo_file in repo_files],
+            },
+        )
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            improvement_response = await post_or_raise(
+                client,
+                f"{DEVELOPER_SERVICE_URL}/improve",
+                improvement_request.model_dump(),
+                "Developer improve",
+            )
+        improvement_message = AgentMessage(**improvement_response.json())
+        improved_output = DeveloperOutput(**improvement_message.payload)
+        #validate_planned_changes(improved_output, repo_files)
+
+        self.context["developer_output"] = improved_output
+        self.agents["developer"]["output"] = improved_output.model_dump()
+        self.agents["developer"]["files"] = {
+            "read": [repo_file.path for repo_file in repo_files],
+            "modified": [change.path for change in improved_output.changes if change.action.lower() in {"update", "upsert"}],
+            "created": [change.path for change in improved_output.changes if change.action.lower() == "create"],
+        }
+        self._add_message("Developer", "Repo", "code.improved", improved_output.model_dump(), "delivered")
+
     async def _run_repo_final(self) -> None:
         ticket: JiraTicket = self.context["ticket"]
         repo: RepoInfo = self.context["repo"]
@@ -560,6 +670,33 @@ class ManualWorkflowController:
         else:
             self.status = "completed"
 
+    async def rerun_current(self) -> None:
+        """Re-executes the agent that just ran (or just failed) instead of
+        advancing to the next one. run_next() always operates on
+        self.steps[self.step_index], and step_index is only incremented after
+        a step succeeds - so to rerun the same step we rewind step_index back
+        to it before delegating to run_next()."""
+        if self.status == "failed":
+            # The step at step_index is the one that failed; it was never
+            # advanced past, so it's already the rerun target.
+            target_index = self.step_index
+        else:
+            # The step that just completed (or the whole workflow, if
+            # "completed") is the one immediately before step_index.
+            target_index = self.step_index - 1
+
+        if target_index < 0 or target_index >= len(self.steps):
+            # Nothing has run yet, or the index is out of range - no-op.
+            return
+
+        step = self.steps[target_index]
+        self.step_index = target_index
+        self.status = "waiting"
+        self.current_action = f"Re-running {step['name']} by operator request."
+        self.current_agent = step["name"]
+        self.next_agent = self.steps[target_index + 1]["name"] if target_index + 1 < len(self.steps) else "None"
+        await self.run_next()
+
     def snapshot(self) -> dict[str, Any]:
         elapsed = self._duration(self.started_at) if self.started_at else "00:00:00"
         repo = self.context.get("repo")
@@ -623,7 +760,7 @@ class ManualWorkflowController:
                 agent["messagesReceived"] += 1
 
     def _mark_agent(self, agent_id: str, status: str, action: str, duration: str | None = None, error: str | None = None) -> None:
-        agent = self.agents[agent_id]
+        agent = self.agents[self._agent_id_for_step(agent_id)]
         now = self._now()
         if status == "running":
             agent["startTime"] = now
@@ -694,7 +831,14 @@ async def workflow_get_mode() -> dict[str, Any]:
 
 
 async def _run_automatic_workflow() -> None:
-    """Runs all workflow steps sequentially without waiting for manual approval."""
+    """Runs all workflow steps sequentially without waiting for manual approval.
+
+    Stop/cancel is honored immediately even mid-step: run_next() cancels its
+    own in-flight task when manual_workflow.request_stop(...) is called from
+    another request, which surfaces here as status flipping to "failed" the
+    moment that run_next() call returns — the loop condition below then exits
+    without kicking off another step.
+    """
     manual_workflow.current_action = "Automatic workflow running..."
     manual_workflow.status = "running"
     await manual_workflow.broadcast()
@@ -743,9 +887,7 @@ async def workflow_resume() -> dict[str, Any]:
 
 @app.post("/api/workflow/stop")
 async def workflow_stop() -> dict[str, Any]:
-    manual_workflow.status = "failed"
-    manual_workflow.running_agent = "None"
-    manual_workflow.current_action = "Workflow stopped by dashboard operator."
+    manual_workflow.request_stop("Workflow stopped by dashboard operator.")
     await manual_workflow.broadcast()
     return command_result("stop")
 
@@ -762,7 +904,7 @@ async def workflow_restart(payload: dict[str, Any] = Body(default_factory=dict))
 
 @app.post("/api/workflow/rerun-current-agent")
 async def workflow_rerun_current() -> dict[str, Any]:
-    await manual_workflow.run_next()
+    await manual_workflow.rerun_current()
     return command_result("rerun-current-agent")
 
 
@@ -775,9 +917,7 @@ async def workflow_skip_agent() -> dict[str, Any]:
 
 @app.post("/api/workflow/cancel")
 async def workflow_cancel() -> dict[str, Any]:
-    manual_workflow.status = "failed"
-    manual_workflow.running_agent = "None"
-    manual_workflow.current_action = "Workflow cancelled by dashboard operator."
+    manual_workflow.request_stop("Workflow cancelled by dashboard operator.")
     await manual_workflow.broadcast()
     return command_result("cancel")
 
