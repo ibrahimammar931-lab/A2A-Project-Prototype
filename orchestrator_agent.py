@@ -160,7 +160,10 @@ def validate_planned_changes(output: DeveloperOutput, repo_files: list) -> None:
 class ManualWorkflowController:
     def __init__(self) -> None:
         self.issue_key = os.getenv("DEFAULT_ISSUE_KEY", "A2A-184")
-        self.base_branch = os.getenv("DEFAULT_BASE_BRANCH", "main")
+        self.default_base_branch = os.getenv("DEFAULT_BASE_BRANCH", "main")
+        self.base_branch = self.default_base_branch
+        self.existing_branch = ""
+        self.open_pr = True
         self.status = "waiting"
         self.current_action = "Ready to start manual workflow."
         self.running_agent = "None"
@@ -249,9 +252,52 @@ class ManualWorkflowController:
             }
         }
 
-    def reset(self, issue_key: str | None = None, base_branch: str | None = None) -> None:
+    def reset(
+        self,
+        issue_key: str | None = None,
+        base_branch: str | None = None,
+        existing_branch: str | None = None,
+        open_pr: bool | None = None,
+    ) -> None:
+        # Validate mutual exclusivity based ONLY on what was explicitly passed
+        # into *this* call. Checking against the merged/fallback state (the
+        # old behavior) was wrong: self.base_branch always has a value
+        # (it defaults to "main" and is never actually empty), so it would
+        # look "provided" even when the caller only passed existing_branch,
+        # causing this to raise on the primary existing-branch path.
+        # Unlike the strict /work-on-ticket API (schemas.GenerateRequest,
+        # which has a real validator and rejects an explicit conflict with a
+        # clear 422), this manual-mode entry point is fed by a dashboard
+        # form. That form's base_branch input realistically always carries
+        # *some* text - its default value - whether or not the operator
+        # actually meant to use it. So if we hard-error whenever both fields
+        # are non-empty, using existing_branch from the UI becomes
+        # impossible: the leftover default in the base_branch box always
+        # trips the "conflict" and Start Workflow silently 400s with no
+        # visible feedback. Instead, explicit existing_branch intent simply
+        # wins and any base_branch value is discarded alongside it.
+        base_given = bool(base_branch and base_branch.strip())
+        existing_given = bool(existing_branch and existing_branch.strip())
+        if base_given and existing_given:
+            logger.info(
+                "Both base_branch (%r) and existing_branch (%r) were submitted; "
+                "existing_branch takes precedence and base_branch is ignored.",
+                base_branch,
+                existing_branch,
+            )
+        # Whichever one was explicitly chosen this call wins outright; clear
+        # the other so a previous reset()'s value doesn't linger and get
+        # treated as still "set" (e.g. a stale existing_branch surviving a
+        # reset that now specifies base_branch).
+        if existing_given:
+            base_branch = ""
+        elif base_given:
+            existing_branch = ""
+
         self.issue_key = issue_key or self.issue_key
-        self.base_branch = base_branch or self.base_branch
+        self.base_branch = base_branch if base_branch is not None else self.base_branch
+        self.existing_branch = existing_branch if existing_branch is not None else self.existing_branch
+        self.open_pr = open_pr if open_pr is not None else self.open_pr
         self.status = "waiting"
         self.current_action = "Workflow started in manual mode. Jira is waiting for approval."
         self.running_agent = "None"
@@ -356,18 +402,25 @@ class ManualWorkflowController:
             )
             repo = RepoInfo(**response.json())
 
-            branch_response = await post_or_raise(
-                client,
-                f"{REPO_SERVICE_URL}/create-branch",
-                CreateBranchRequest(
-                    repo_url=repo.remote_url,
-                    issue_key=ticket.key,
-                    title=ticket.summary,
-                    base_branch=self.base_branch,
-                ).model_dump(),
-                "Repo create-branch",
-            )
-        branch = BranchResponse(**branch_response.json())
+            if self.existing_branch:
+                branch = BranchResponse(
+                    repo_id=repo.repo_id,
+                    branch=self.existing_branch,
+                    base_branch=self.base_branch or self.default_base_branch,
+                )
+            else:
+                branch_response = await post_or_raise(
+                    client,
+                    f"{REPO_SERVICE_URL}/create-branch",
+                    CreateBranchRequest(
+                        repo_url=repo.remote_url,
+                        issue_key=ticket.key,
+                        title=ticket.summary,
+                        base_branch=self.base_branch,
+                    ).model_dump(),
+                    "Repo create-branch",
+                )
+                branch = BranchResponse(**branch_response.json())
         self.context["repo"] = repo
         self.context["branch"] = branch
         self.agents["repo-initial"]["output"] = {
@@ -579,21 +632,22 @@ class ManualWorkflowController:
                     {"repository_path": repo.path, "changes": [change.model_dump() for change in output.changes]},
                     "Knowledge update",
                 )
-                pr_response = await post_or_raise(
-                    client,
-                    f"{REPO_SERVICE_URL}/open-pr",
-                    PullRequestRequest(
-                        repo_url=repo.remote_url,
-                        issue_key=ticket.key,
-                        title=ticket.summary,
-                        summary=ticket.description or "Pull request created by orchestrator.",
-                        base_branch=self.base_branch,
-                        head_branch=branch.branch,
-                        ticket_url=ticket.url,
-                    ).model_dump(),
-                    "Repo open-pr",
-                )
-                pull_request = PullRequestResponse(**pr_response.json())
+                if self.open_pr:
+                    pr_response = await post_or_raise(
+                        client,
+                        f"{REPO_SERVICE_URL}/open-pr",
+                        PullRequestRequest(
+                            repo_url=repo.remote_url,
+                            issue_key=ticket.key,
+                            title=ticket.summary,
+                            summary=ticket.description or "Pull request created by orchestrator.",
+                            base_branch=self.base_branch or self.default_base_branch,
+                            head_branch=branch.branch,
+                            ticket_url=ticket.url,
+                        ).model_dump(),
+                        "Repo open-pr",
+                    )
+                    pull_request = PullRequestResponse(**pr_response.json())
         output_payload = {
             "commits": applied_changes.commit_shas if applied_changes else [],
             "changed_files": applied_changes.changed_files if applied_changes else [],
@@ -705,7 +759,7 @@ class ManualWorkflowController:
             "summary": {
                 "status": self._dashboard_status(),
                 "ticket": self.issue_key,
-                "branch": branch.branch if branch else self.base_branch,
+                "branch": branch.branch if branch else (self.existing_branch or self.base_branch or self.default_base_branch),
                 "repository": repo.remote_url if repo else os.getenv("GITHUB_REPO_URL", "Not prepared"),
                 "runningAgent": self.running_agent,
                 "currentAction": self.current_action,
@@ -796,6 +850,22 @@ def command_result(command: str) -> dict[str, Any]:
     return {"command": command, "accepted": True, "timestamp": manual_workflow._now()}
 
 
+def _first_provided(payload: dict[str, Any], *keys: str) -> Any:
+    """Returns the value for the first key that is actually present in the
+    payload, checking in order - even if that value is an empty string.
+
+    This matters because `payload.get("a") or payload.get("b")` treats an
+    explicitly-sent empty string for "a" the same as "a" being absent, and
+    silently falls through to "b" instead of honoring the caller's explicit
+    "clear this field" intent. Only returns None if none of the keys were
+    present at all.
+    """
+    for key in keys:
+        if key in payload:
+            return payload[key]
+    return None
+
+
 @app.get("/api/workflow/state")
 async def workflow_state() -> dict[str, Any]:
     return manual_workflow.snapshot()
@@ -853,8 +923,10 @@ async def _run_automatic_workflow() -> None:
 @app.post("/api/workflow/start")
 async def workflow_start(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     manual_workflow.reset(
-        issue_key=payload.get("issue_key") or payload.get("ticket"),
-        base_branch=payload.get("base_branch") or payload.get("branch"),
+        issue_key=_first_provided(payload, "issue_key", "ticket"),
+        base_branch=_first_provided(payload, "base_branch", "branch"),
+        existing_branch=payload.get("existing_branch"),
+        open_pr=payload.get("open_pr"),
     )
     await manual_workflow.broadcast()
     if current_mode == "automatic":
@@ -894,9 +966,14 @@ async def workflow_stop() -> dict[str, Any]:
 
 @app.post("/api/workflow/restart")
 async def workflow_restart(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    issue_key = payload["issue_key"] if "issue_key" in payload else manual_workflow.issue_key
+    base_branch = payload["base_branch"] if "base_branch" in payload else manual_workflow.base_branch
+    existing_branch = payload["existing_branch"] if "existing_branch" in payload else manual_workflow.existing_branch
     manual_workflow.reset(
-        issue_key=payload.get("issue_key") or manual_workflow.issue_key,
-        base_branch=payload.get("base_branch") or manual_workflow.base_branch,
+        issue_key=issue_key,
+        base_branch=base_branch,
+        existing_branch=existing_branch,
+        open_pr=payload.get("open_pr") if "open_pr" in payload else manual_workflow.open_pr,
     )
     await manual_workflow.broadcast()
     return command_result("restart")
@@ -953,6 +1030,11 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
     repo_files = []
     planning_result: PlanningResult | None = None
 
+    # NOTE: mutual exclusivity of base_branch/existing_branch is enforced by
+    # GenerateRequest.validate_branch_exclusivity (schemas.py). FastAPI
+    # validates the request body into that model before this function body
+    # ever runs, so a duplicate check here would be unreachable dead code.
+
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             ticket_response = await client.get(
@@ -979,18 +1061,25 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 )
             )
 
-            branch_response = await post_or_raise(
-                client,
-                f"{REPO_SERVICE_URL}/create-branch",
-                CreateBranchRequest(
-                    repo_url=repo.remote_url,
-                    issue_key=ticket.key,
-                    title=ticket.summary,
-                    base_branch=request.base_branch,
-                ).model_dump(),
-                "Repo create-branch",
-            )
-            branch = BranchResponse(**branch_response.json())
+            if request.existing_branch:
+                branch = BranchResponse(
+                    repo_id=repo.repo_id,
+                    branch=request.existing_branch,
+                    base_branch=request.base_branch or os.getenv("DEFAULT_BASE_BRANCH", "main"),
+                )
+            else:
+                branch_response = await post_or_raise(
+                    client,
+                    f"{REPO_SERVICE_URL}/create-branch",
+                    CreateBranchRequest(
+                        repo_url=repo.remote_url,
+                        issue_key=ticket.key,
+                        title=ticket.summary,
+                        base_branch=request.base_branch or os.getenv("DEFAULT_BASE_BRANCH", "main"),
+                    ).model_dump(),
+                    "Repo create-branch",
+                )
+                branch = BranchResponse(**branch_response.json())
             messages.append(
                 AgentMessage(
                     sender="orchestrator_agent",
@@ -1265,29 +1354,30 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                     )
                 )
 
-                pr_response = await post_or_raise(
-                    client,
-                    f"{REPO_SERVICE_URL}/open-pr",
-                    PullRequestRequest(
-                        repo_url=repo.remote_url,
-                        issue_key=ticket.key,
-                        title=ticket.summary,
-                        summary=ticket.description or "Pull request created by orchestrator.",
-                        base_branch=request.base_branch,
-                        head_branch=branch.branch,
-                        ticket_url=ticket.url,
-                    ).model_dump(),
-                    "Repo open-pr",
-                )
-                pull_request = PullRequestResponse(**pr_response.json())
-                messages.append(
-                    AgentMessage(
-                        sender="orchestrator_agent",
-                        receiver="repo_agent",
-                        message_type="repo_pr_opened",
-                        payload=pull_request.model_dump(),
+                if request.open_pr:
+                    pr_response = await post_or_raise(
+                        client,
+                        f"{REPO_SERVICE_URL}/open-pr",
+                        PullRequestRequest(
+                            repo_url=repo.remote_url,
+                            issue_key=ticket.key,
+                            title=ticket.summary,
+                            summary=ticket.description or "Pull request created by orchestrator.",
+                            base_branch=request.base_branch or os.getenv("DEFAULT_BASE_BRANCH", "main"),
+                            head_branch=branch.branch,
+                            ticket_url=ticket.url,
+                        ).model_dump(),
+                        "Repo open-pr",
                     )
-                )
+                    pull_request = PullRequestResponse(**pr_response.json())
+                    messages.append(
+                        AgentMessage(
+                            sender="orchestrator_agent",
+                            receiver="repo_agent",
+                            message_type="repo_pr_opened",
+                            payload=pull_request.model_dump(),
+                        )
+                    )
 
         return GenerateResponse(
             ticket=ticket,

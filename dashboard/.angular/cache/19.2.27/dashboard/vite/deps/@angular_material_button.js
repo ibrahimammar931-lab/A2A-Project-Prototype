@@ -1,9 +1,11 @@
 import {
+  MatRippleModule
+} from "./chunk-TPGRT3XP.js";
+import {
   MAT_RIPPLE_GLOBAL_OPTIONS,
-  MatRippleModule,
   RippleRenderer,
   defaultRippleAnimationConfig
-} from "./chunk-PG6ECMFF.js";
+} from "./chunk-DM6RWZ6D.js";
 import {
   _StructuralStylesLoader
 } from "./chunk-SROLS7DE.js";
@@ -14,7 +16,8 @@ import {
   FocusMonitor,
   MatCommonModule,
   _getEventTarget
-} from "./chunk-E27KPNA5.js";
+} from "./chunk-V2G75BKM.js";
+import "./chunk-KQLRACRO.js";
 import {
   _CdkPrivateStyleLoader,
   _bindEventWithOptions
@@ -22,7 +25,6 @@ import {
 import {
   Platform
 } from "./chunk-UMCZFHBK.js";
-import "./chunk-KQLRACRO.js";
 import "./chunk-5ZAPDDDC.js";
 import {
   DOCUMENT

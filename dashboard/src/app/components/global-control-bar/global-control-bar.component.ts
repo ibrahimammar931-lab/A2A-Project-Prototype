@@ -6,6 +6,7 @@ import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatIconModule } from '@angular/material/icon';
 import { MatInputModule } from '@angular/material/input';
 import { MatProgressBarModule } from '@angular/material/progress-bar';
+import { MatSlideToggleModule } from '@angular/material/slide-toggle';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { WorkflowStateService } from '../../services/workflow-state.service';
 import { WorkflowStatus } from '../../models/workflow.models';
@@ -13,7 +14,7 @@ import { WorkflowStatus } from '../../models/workflow.models';
 @Component({
   selector: 'app-global-control-bar',
   standalone: true,
-  imports: [FormsModule, MatButtonModule, MatButtonToggleModule, MatFormFieldModule, MatIconModule, MatInputModule, MatProgressBarModule, MatTooltipModule],
+  imports: [FormsModule, MatButtonModule, MatButtonToggleModule, MatFormFieldModule, MatIconModule, MatInputModule, MatProgressBarModule, MatSlideToggleModule, MatTooltipModule],
   template: `
     <section class="control-bar">
       <div class="summary-line">
@@ -42,6 +43,10 @@ import { WorkflowStatus } from '../../models/workflow.models';
           <mat-label>Base Branch</mat-label>
           <input matInput [(ngModel)]="workflowBranch" placeholder="main">
         </mat-form-field>
+        <mat-form-field appearance="outline">
+          <mat-label>Existing Branch</mat-label>
+          <input matInput [(ngModel)]="workflowExistingBranch" placeholder="feature/my-branch">
+        </mat-form-field>
       </div>
 
       <div class="actions">
@@ -55,6 +60,10 @@ import { WorkflowStatus } from '../../models/workflow.models';
             Automatic
           </mat-button-toggle>
         </mat-button-toggle-group>
+
+        <mat-slide-toggle [(ngModel)]="workflowOpenPr" color="primary" matTooltip="Open a pull request after applying changes">
+          Open PR
+        </mat-slide-toggle>
 
         <button mat-flat-button color="primary" (click)="startWorkflow()">
           <mat-icon>play_arrow</mat-icon>
@@ -97,7 +106,7 @@ import { WorkflowStatus } from '../../models/workflow.models';
 
     .start-inputs {
       display: grid;
-      grid-template-columns: minmax(180px, 260px) minmax(180px, 260px);
+      grid-template-columns: minmax(180px, 260px) minmax(180px, 260px) minmax(180px, 260px);
       gap: 10px;
       align-items: start;
     }
@@ -174,6 +183,8 @@ export class GlobalControlBarComponent {
   readonly statusIcon = computed(() => statusIcon(this.summary().status));
   workflowTicket = localStorage.getItem('workflowTicket') ?? '';
   workflowBranch = localStorage.getItem('workflowBranch') ?? '';
+  workflowExistingBranch = localStorage.getItem('workflowExistingBranch') ?? '';
+  workflowOpenPr = localStorage.getItem('workflowOpenPr') !== 'false';
 
   label(value: string): string {
     return value.split('-').map((part) => part[0].toUpperCase() + part.slice(1)).join(' ');
@@ -187,9 +198,13 @@ export class GlobalControlBarComponent {
   startWorkflow(): void {
     const ticket = this.workflowTicket.trim();
     const branch = this.workflowBranch.trim() || 'main';
+    const existingBranch = this.workflowExistingBranch.trim();
+    const openPr = this.workflowOpenPr;
     localStorage.setItem('workflowTicket', ticket);
     localStorage.setItem('workflowBranch', branch);
-    this.workflow.startWorkflow(ticket, branch);
+    localStorage.setItem('workflowExistingBranch', existingBranch);
+    localStorage.setItem('workflowOpenPr', String(openPr));
+    this.workflow.startWorkflow(ticket, branch, existingBranch, openPr);
   }
 }
 
