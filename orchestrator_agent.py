@@ -139,8 +139,6 @@ def build_review_diff(changes: list[dict], repo_files: list) -> str:
 
 def validate_planned_changes(output: DeveloperOutput, repo_files: list) -> None:
     allowed_paths = {repo_file.path for repo_file in repo_files}
-    if not allowed_paths:
-        return
 
     unexpected_paths = [
         change.path
@@ -149,7 +147,7 @@ def validate_planned_changes(output: DeveloperOutput, repo_files: list) -> None:
         and change.path not in allowed_paths
     ]
     if unexpected_paths:
-        allowed = ", ".join(sorted(allowed_paths))
+        allowed = ", ".join(sorted(allowed_paths)) or "(none — no existing files were provided)"
         unexpected = ", ".join(unexpected_paths)
         raise ValueError(
             "Developer attempted to change files outside the Planner-selected files. "
@@ -497,7 +495,7 @@ class ManualWorkflowController:
                 "Developer generate",
             )
         output = DeveloperOutput(**generation_response.json())
-        #validate_planned_changes(output, self.context["repo_files"])
+        validate_planned_changes(output, self.context["repo_files"])
         self.context["developer_output"] = output
         self.agents["developer"]["output"] = output.model_dump()
         self.agents["developer"]["files"] = {
@@ -594,7 +592,7 @@ class ManualWorkflowController:
             )
         improvement_message = AgentMessage(**improvement_response.json())
         improved_output = DeveloperOutput(**improvement_message.payload)
-        #validate_planned_changes(improved_output, repo_files)
+        validate_planned_changes(improved_output, repo_files)
 
         self.context["developer_output"] = improved_output
         self.agents["developer"]["output"] = improved_output.model_dump()
@@ -1167,7 +1165,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 "Developer generate",
             )
             original_output = DeveloperOutput(**generation_response.json())
-            #validate_planned_changes(original_output, repo_files)
+            validate_planned_changes(original_output, repo_files)
 
             review_request = AgentMessage(
                 sender="orchestrator_agent",
@@ -1245,7 +1243,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 improvement_message = AgentMessage(**improvement_response.json())
                 messages.append(improvement_message)
                 improved_output = DeveloperOutput(**improvement_message.payload)
-                #validate_planned_changes(improved_output, repo_files)
+                validate_planned_changes(improved_output, repo_files)
             else:
                 improved_output = original_output
 
