@@ -199,10 +199,27 @@ class KnowledgeAgent:
         return result
 
     def _summarize_file(self, rel_path: str, content: str) -> Dict[str, Any]:
-        """Call the local LLM to summarize a single file into structured knowledge."""
+        """Call the local LLM to summarize a single file into structured knowledge.
+
+        NOTE (markdown test): the outer envelope stays JSON — path/classes/
+        functions/imports/exports/metadata remain addressable fields, since
+        update_knowledge and the dashboard's json-viewer key off them
+        individually. Only `summary` (the field actually consumed as prose
+        by the Planner's prompt) is now requested as Markdown instead of a
+        plain string, to test whether the Planner reasons better/cheaper
+        over structured prose vs. flat text.
+        """
         system = (
-            "You are a project knowledge extractor. Read the file contents and produce a concise, structured JSON summary. "
-            "Do NOT output source code or store the file contents. Only return JSON with the requested fields."
+            "You are a project knowledge extractor. Read the file contents and produce a concise, "
+            "structured JSON summary. Do NOT output source code or store the file contents. "
+            "Only return JSON with the requested fields.\n\n"
+            "The `summary` field must be a Markdown-formatted string (not plain text), following this shape:\n"
+            "## <short file title>\n"
+            "<2-3 sentence description of what this file does and why it exists>\n\n"
+            "**Key functions/classes:** <comma-separated list of the most important ones, in backticks>\n\n"
+            "**Depends on:** <comma-separated list of the most important imports/dependencies, in backticks>\n\n"
+            "Keep the whole `summary` value under ~120 words. Do not include a top-level '#' heading, "
+            "only the '##' shown above. Do not wrap the markdown in a code fence."
         )
 
         max_content_length = 15000
@@ -213,8 +230,17 @@ class KnowledgeAgent:
 
         user_prompt = (
             f"Path: {rel_path}\n\nFile Content:\n" + prompt_content + "\n\n"
-            "Produce JSON with these fields: path, file_purpose, summary, classes (list), functions (list), imports (list), exports (list), metadata (object). "
-            "Keep values short and focused. If a field is empty, use an empty list or empty string/object."
+            "Produce JSON with these fields:\n"
+            "- path (string)\n"
+            "- file_purpose (string, ONE short plain-text sentence, no markdown)\n"
+            "- summary (string, Markdown-formatted as specified in the system prompt)\n"
+            "- classes (list of strings)\n"
+            "- functions (list of strings)\n"
+            "- imports (list of strings)\n"
+            "- exports (list of strings)\n"
+            "- metadata (object)\n\n"
+            "If a field is empty, use an empty list or empty string/object. "
+            "Only `summary` should contain Markdown — all other fields stay plain."
         )
 
         try:
@@ -259,10 +285,13 @@ class KnowledgeAgent:
                 if line.startswith("class "):
                     classes.append(line.split("(")[0].replace("class ", "").strip(":"))
 
+            fallback_summary = (content[:200] + "...") if len(content) > 200 else content
             return {
                 "path": rel_path,
                 "file_purpose": "",
-                "summary": (content[:200] + "...") if len(content) > 200 else content,
+                # Fallback path has no LLM available to format markdown, so this
+                # stays plain text — it's a degraded-mode result, not the tested format.
+                "summary": fallback_summary,
                 "classes": classes,
                 "functions": functions,
                 "imports": imports,

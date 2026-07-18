@@ -81,7 +81,6 @@ class PlanningResult(BaseModel):
     task_summary: str
     requirements: list[str] = Field(default_factory=list)
     implementation_steps: list[str] = Field(default_factory=list)
-    likely_modules: list[str] = Field(default_factory=list)
     likely_existing_files: list[str] = Field(default_factory=list)
     new_files: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
@@ -110,7 +109,6 @@ class AgentTaskRequest(BaseModel):
     task: str
     ticket: JiraTicket | None = None
     planning_result: PlanningResult | None = None
-    likely_modules: list[str] = Field(default_factory=list)
     likely_existing_files: list[str] = Field(default_factory=list)
     planned_new_files: list[str] = Field(default_factory=list)
     repo_files: list[RepoFile] = Field(default_factory=list)

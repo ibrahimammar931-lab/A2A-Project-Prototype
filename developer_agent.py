@@ -57,14 +57,6 @@ def format_plan(planning_result: PlanningResult | None) -> str:
     )
 
 
-def format_likely_modules(planning_result: PlanningResult | None) -> str:
-    if not planning_result or not planning_result.likely_modules:
-        return ""
-
-    modules = "\n".join(f"- {module}" for module in planning_result.likely_modules)
-    return f"\n\nLikely modules:\n{modules}\n"
-
-
 def format_likely_existing_files(planning_result: PlanningResult | None) -> str:
     if not planning_result or not planning_result.likely_existing_files:
         return ""
@@ -117,7 +109,6 @@ class DeveloperAgent:
             "Do not wrap the JSON in Markdown.\n\n"
             f"Task: {task}"
             f"{format_ticket(ticket)}"
-            f"{format_likely_modules(planning_result)}"
             f"{format_likely_existing_files(planning_result)}"
             f"{format_plan(planning_result)}"
             f"{format_repo_files(repo_files or [])}"
@@ -152,7 +143,6 @@ class DeveloperAgent:
             f"{format_ticket(ticket)}"
             f"Original code:\n{original_code}\n\n"
             f"Reviewer feedback JSON:\n{review_feedback.model_dump_json(indent=2)}"
-            f"{format_likely_modules(planning_result)}"
             f"{format_likely_existing_files(planning_result)}"
             f"{format_plan(planning_result)}"
             f"{format_repo_files(repo_files or [])}"

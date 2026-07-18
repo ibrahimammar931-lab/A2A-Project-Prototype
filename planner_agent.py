@@ -35,20 +35,31 @@ class PlannerAgent:
     ) -> PlanningResult:
         logger.info("Planner agent planning ticket %s", jira_ticket.key)
         prompt = (
-            "Create an implementation plan for this Jira ticket using the project knowledge.\n"
-            "Do not generate source code. Do not edit files. Do not review code. Do not call tools.\n"
-            "Prefer modifying existing files when they already implement the required responsibility.\n"
-            "Suggest creating new files whenever doing so results in a cleaner architecture or is necessary for the feature.\n"
-            "Do not avoid new files simply because they are not present in the project.\n"
-            "Follow the existing project structure and naming conventions when proposing new files.\n"
-            "Never duplicate existing functionality.\n"
-            "If a new file is required, mention it explicitly in implementation_steps.\n"
-            "Return only valid JSON with exactly these keys: task_summary, requirements, "
-            "implementation_steps, likely_modules, likely_existing_files, new_files, acceptance_criteria, risks, complexity.\n"
-            "complexity must be one of: Low, Medium, High.\n\n"
-            f"Jira ticket:\n{jira_ticket.model_dump_json(indent=2)}\n\n"
-            f"Project knowledge:\n{json.dumps(project_knowledge, indent=2)}"
-        )
+        "Create an implementation plan for this Jira ticket using the project knowledge.\n"
+        "Do not generate source code. Do not edit files. Do not review code. Do not call tools.\n"
+        "Prefer modifying existing files when they already implement the required responsibility.\n"
+        "Suggest creating new files whenever doing so results in a cleaner architecture or is necessary for the feature.\n"
+        "Do not avoid new files simply because they are not present in the project.\n"
+        "Follow the existing project structure and naming conventions when proposing new files.\n"
+        "Never duplicate existing functionality.\n"
+        "If a new file is required, mention it explicitly in implementation_steps.\n"
+        "\n"
+        "INTEGRATION RULE: a new file is useless until something wires it in. Always check whether an "
+        "existing file must be modified to register/import/mount the new code (e.g. the app entrypoint "
+        "that calls app.include_router(...) for a new route file, or wherever models/services get "
+        "registered). Use the project knowledge (look for signals like 'FastAPI(', 'include_router', "
+        "'app = ') to find it and add it to likely_existing_files. Never leave likely_existing_files "
+        "empty when new_files needs wiring — if unsure, name your best guess (e.g. main.py) rather than "
+        "omit it. Only leave it empty for standalone additions nothing else calls.\n"
+        "\n"
+        "Return only valid JSON with exactly these keys: task_summary, requirements, "
+        "implementation_steps, likely_existing_files, new_files, acceptance_criteria, risks, complexity.\n"
+        "complexity must be one of: Low, Medium, High.\n\n"
+        f"Jira ticket:\n{jira_ticket.model_dump_json(indent=2)}\n\n"
+        f"Project knowledge:\n{json.dumps(project_knowledge, indent=2)}"
+)
+            
+        
 
         response = self.client.chat.completions.create(
             model=self.model,
