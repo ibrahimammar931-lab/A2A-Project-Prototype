@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Developer Agent Service", version="1.0.0")
 
 
+def _normalize_path(path: str) -> str:
+    """Match the Planner's normalization so paths compare consistently
+    across services regardless of which OS produced them."""
+    return path.replace("\\", "/").strip()
+
+
 def format_repo_files(repo_files: list[RepoFile]) -> str:
     if not repo_files:
         return ""
@@ -57,14 +63,6 @@ def format_plan(planning_result: PlanningResult | None) -> str:
     )
 
 
-def format_likely_existing_files(planning_result: PlanningResult | None) -> str:
-    if not planning_result or not planning_result.likely_existing_files:
-        return ""
-
-    paths = "\n".join(f"- {path}" for path in planning_result.likely_existing_files)
-    return f"\n\nLikely existing files to inspect:\n{paths}\n"
-
-
 def format_planned_new_files(planned_new_files: list[str] | None) -> str:
     if not planned_new_files:
         return ""
@@ -74,6 +72,27 @@ def format_planned_new_files(planned_new_files: list[str] | None) -> str:
         "\n\nPlanner-requested new files:\n"
         f"{paths}\n"
         "If these files are necessary to satisfy the ticket, create them.\n"
+    )
+
+
+def format_file_boundary_rule(repo_files: list) -> str:
+    """Shortened version: keeps the hard create/update boundary and the
+    'flag, don't fabricate' instruction, drops the explanatory prose."""
+    repo_files = repo_files or []
+    allowed_paths = [_normalize_path(rf.path) for rf in repo_files]
+
+    if allowed_paths:
+        paths_list = "\n".join(f"- {p}" for p in allowed_paths)
+        allowed_section = f"Files you have real content for:\n{paths_list}\n"
+    else:
+        allowed_section = "You have not been given any existing file's content.\n"
+
+    return (
+        "\n\nFILE RULE:\n"
+        f"{allowed_section}"
+        "\"create\" is fine for new files. \"update\"/\"upsert\" is only allowed on the paths "
+        "listed above. If another existing file also needs changing, do not guess its content — "
+        "note it in `explanation` instead. Use forward slashes in paths.\n"
     )
 
 
@@ -100,16 +119,16 @@ class DeveloperAgent:
             "Focus only on the requested behavior and preserve the existing application structure.\n"
             "Do not refactor unrelated code, add broad validation, or redesign the architecture.\n"
             "The implementation plan is guidance, not a restriction.\n"
-            "You may create additional source files if they are necessary to implement the Jira ticket correctly and follow the project's architecture.\n"
-            "Do not limit yourself only to the files listed by the Planner.\n"
+            "You may create additional new source files if they are necessary to implement the "
+            "Jira ticket correctly and follow the project's architecture.\n"
             f"{format_planned_new_files(planned_new_files)}"
+            f"{format_file_boundary_rule(repo_files)}"
             "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
             "The changes value must be a list of objects with path, action, and content.\n"
             "Each change.content must be the full file contents after the edit, not a summary.\n"
             "Do not wrap the JSON in Markdown.\n\n"
             f"Task: {task}"
             f"{format_ticket(ticket)}"
-            f"{format_likely_existing_files(planning_result)}"
             f"{format_plan(planning_result)}"
             f"{format_repo_files(repo_files or [])}"
         )
@@ -132,9 +151,10 @@ class DeveloperAgent:
             "Only address blocking issues from the review feedback. Ignore optional suggestions and style-only feedback.\n"
             "Do not refactor unrelated code or change the core design.\n"
             "The implementation plan is guidance, not a restriction.\n"
-            "You may create additional source files if they are necessary to implement the Jira ticket correctly and follow the project's architecture.\n"
-            "Do not limit yourself only to the files listed by the Planner.\n"
+            "You may create additional new source files if they are necessary to implement the "
+            "Jira ticket correctly and follow the project's architecture.\n"
             f"{format_planned_new_files(planned_new_files)}"
+            f"{format_file_boundary_rule(repo_files)}"
             "Return only valid JSON with exactly these keys: code, explanation, changes.\n"
             "The changes value must be a list of objects with path, action, and content.\n"
             "Each change.content must be the full file contents after the edit, not a summary.\n"
@@ -143,7 +163,6 @@ class DeveloperAgent:
             f"{format_ticket(ticket)}"
             f"Original code:\n{original_code}\n\n"
             f"Reviewer feedback JSON:\n{review_feedback.model_dump_json(indent=2)}"
-            f"{format_likely_existing_files(planning_result)}"
             f"{format_plan(planning_result)}"
             f"{format_repo_files(repo_files or [])}"
         )
@@ -158,6 +177,8 @@ class DeveloperAgent:
                     "content": (
                         "You are a senior developer agent for a Jira-driven workflow. "
                         "Implement the ticket requirements precisely and preserve existing behavior. "
+                        "Never fabricate the content of a file you have not been shown — creating new "
+                        "files is fine, but rewriting an existing file you were never given is not. "
                         "Respond with strict JSON only."
                     ),
                 },
@@ -172,7 +193,15 @@ class DeveloperAgent:
             raise ValueError("Developer model returned an empty response.")
 
         data = json.loads(content)
-        return DeveloperOutput(**data)
+        output = DeveloperOutput(**data)
+
+        # Normalize every change's path to forward-slash form so it matches
+        # repo_files / allowed_paths consistently regardless of OS, the same
+        # way the Planner normalizes likely_existing_files and new_files.
+        for change in output.changes:
+            change.path = _normalize_path(change.path)
+
+        return output
 
 
 @app.post("/generate", response_model=DeveloperOutput)

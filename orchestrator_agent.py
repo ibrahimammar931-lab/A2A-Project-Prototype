@@ -385,6 +385,26 @@ class ManualWorkflowController:
 
     async def _run_jira(self) -> None:
         async with httpx.AsyncClient(timeout=60) as client:
+            # Sync all branch knowledge before starting any real work.
+            # This is unconditional housekeeping that runs identically in
+            # manual and automatic modes — no operator approval needed.
+            # We prepare the repo early (idempotent call) just to get the
+            # repository path for the sync; _run_repo_initial will call
+            # prepare-repo again later for the actual branch setup.
+            repo_response = await post_or_raise(
+                client,
+                f"{REPO_SERVICE_URL}/prepare-repo",
+                PrepareRepoRequest(repo_url=self.repo_url or None).model_dump(),
+                "Repo prepare (pre-sync)",
+            )
+            repo = RepoInfo(**repo_response.json())
+            await post_or_raise(
+                client,
+                f"{KNOWLEDGE_SERVICE_URL}/sync-branches",
+                {"repository_path": repo.path},
+                "Knowledge sync-branches",
+            )
+
             response = await client.get(f"{JIRA_SERVICE_URL}/tickets/{self.issue_key}")
             response.raise_for_status()
             ticket = JiraTicket(**response.json())
@@ -422,6 +442,7 @@ class ManualWorkflowController:
                     "Repo create-branch",
                 )
                 branch = BranchResponse(**branch_response.json())
+
         self.context["repo"] = repo
         self.context["branch"] = branch
         self.agents["repo-initial"]["output"] = {
@@ -433,11 +454,12 @@ class ManualWorkflowController:
 
     async def _run_knowledge(self) -> None:
         repo: RepoInfo = self.context["repo"]
+        branch: BranchResponse = self.context["branch"]
         async with httpx.AsyncClient(timeout=60) as client:
             response = await post_or_raise(
                 client,
                 f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
-                {"repository_path": repo.path},
+                {"repository_path": repo.path, "branch": branch.branch},
                 "Knowledge ensure",
             )
         knowledge = response.json()
@@ -628,7 +650,7 @@ class ManualWorkflowController:
                 await post_or_raise(
                     client,
                     f"{KNOWLEDGE_SERVICE_URL}/update-knowledge",
-                    {"repository_path": repo.path, "changes": [change.model_dump() for change in output.changes]},
+                    {"repository_path": repo.path, "branch": branch.branch, "changes": [change.model_dump() for change in output.changes]},
                     "Knowledge update",
                 )
                 if self.open_pr:
@@ -1022,6 +1044,8 @@ async def workflow_send_edited_message(payload: dict[str, Any] = Body(...)) -> d
     return command_result("send-edited-message")
 
 
+
+
 @app.post("/work-on-ticket", response_model=GenerateResponse)
 async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
     messages: list[AgentMessage] = []
@@ -1037,6 +1061,23 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
+            # Sync all branch knowledge before starting any real work.
+            repo_response = await post_or_raise(
+                client,
+                f"{REPO_SERVICE_URL}/prepare-repo",
+                PrepareRepoRequest(repo_url=request.repo_url or None).model_dump(),
+                "Repo prepare",
+            )
+            # Use the prepared repo path for sync, then prepare again below
+            # (idempotent) before proceeding — the second call is cheap.
+            _pre_sync_repo = RepoInfo(**repo_response.json())
+            await post_or_raise(
+                client,
+                f"{KNOWLEDGE_SERVICE_URL}/sync-branches",
+                {"repository_path": _pre_sync_repo.path},
+                "Knowledge sync-branches",
+            )
+
             ticket_response = await client.get(
                 f"{JIRA_SERVICE_URL}/tickets/{request.issue_key}"
             )
@@ -1080,6 +1121,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                     "Repo create-branch",
                 )
                 branch = BranchResponse(**branch_response.json())
+
             messages.append(
                 AgentMessage(
                     sender="orchestrator_agent",
@@ -1092,7 +1134,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
             knowledge_response = await post_or_raise(
                 client,
                 f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
-                {"repository_path": repo.path},
+                {"repository_path": repo.path, "branch": branch.branch},
                 "Knowledge ensure",
             )
             knowledge = knowledge_response.json()
@@ -1297,6 +1339,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                     f"{KNOWLEDGE_SERVICE_URL}/update-knowledge",
                     {
                         "repository_path": repo.path,
+                        "branch": branch.branch,
                         "changes": [change.model_dump() for change in improved_output.changes],
                     },
                     "Knowledge update",
