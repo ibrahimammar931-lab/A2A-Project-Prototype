@@ -190,7 +190,6 @@ export class GlobalControlBarComponent {
   workflowExistingBranch = localStorage.getItem('workflowExistingBranch') ?? '';
   workflowRepoUrl = localStorage.getItem('workflowRepoUrl') ?? '';
   workflowOpenPr = localStorage.getItem('workflowOpenPr') !== 'false';
-
   label(value: string): string {
     return value.split('-').map((part) => part[0].toUpperCase() + part.slice(1)).join(' ');
   }

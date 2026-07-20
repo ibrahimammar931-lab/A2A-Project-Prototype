@@ -139,8 +139,6 @@ def build_review_diff(changes: list[dict], repo_files: list) -> str:
 
 def validate_planned_changes(output: DeveloperOutput, repo_files: list) -> None:
     allowed_paths = {repo_file.path for repo_file in repo_files}
-    if not allowed_paths:
-        return
 
     unexpected_paths = [
         change.path
@@ -149,7 +147,7 @@ def validate_planned_changes(output: DeveloperOutput, repo_files: list) -> None:
         and change.path not in allowed_paths
     ]
     if unexpected_paths:
-        allowed = ", ".join(sorted(allowed_paths))
+        allowed = ", ".join(sorted(allowed_paths)) or "(none — no existing files were provided)"
         unexpected = ", ".join(unexpected_paths)
         raise ValueError(
             "Developer attempted to change files outside the Planner-selected files. "
@@ -387,6 +385,26 @@ class ManualWorkflowController:
 
     async def _run_jira(self) -> None:
         async with httpx.AsyncClient(timeout=60) as client:
+            # Sync all branch knowledge before starting any real work.
+            # This is unconditional housekeeping that runs identically in
+            # manual and automatic modes — no operator approval needed.
+            # We prepare the repo early (idempotent call) just to get the
+            # repository path for the sync; _run_repo_initial will call
+            # prepare-repo again later for the actual branch setup.
+            repo_response = await post_or_raise(
+                client,
+                f"{REPO_SERVICE_URL}/prepare-repo",
+                PrepareRepoRequest(repo_url=self.repo_url or None).model_dump(),
+                "Repo prepare (pre-sync)",
+            )
+            repo = RepoInfo(**repo_response.json())
+            await post_or_raise(
+                client,
+                f"{KNOWLEDGE_SERVICE_URL}/sync-branches",
+                {"repository_path": repo.path},
+                "Knowledge sync-branches",
+            )
+
             response = await client.get(f"{JIRA_SERVICE_URL}/tickets/{self.issue_key}")
             response.raise_for_status()
             ticket = JiraTicket(**response.json())
@@ -424,6 +442,7 @@ class ManualWorkflowController:
                     "Repo create-branch",
                 )
                 branch = BranchResponse(**branch_response.json())
+
         self.context["repo"] = repo
         self.context["branch"] = branch
         self.agents["repo-initial"]["output"] = {
@@ -435,11 +454,12 @@ class ManualWorkflowController:
 
     async def _run_knowledge(self) -> None:
         repo: RepoInfo = self.context["repo"]
+        branch: BranchResponse = self.context["branch"]
         async with httpx.AsyncClient(timeout=60) as client:
             response = await post_or_raise(
                 client,
                 f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
-                {"repository_path": repo.path},
+                {"repository_path": repo.path, "branch": branch.branch},
                 "Knowledge ensure",
             )
         knowledge = response.json()
@@ -490,7 +510,6 @@ class ManualWorkflowController:
                     task=self.context["task"],
                     ticket=ticket,
                     planning_result=planning_result,
-                    likely_modules=list(dict.fromkeys(planning_result.likely_modules)),
                     likely_existing_files=planned_existing_files,
                     planned_new_files=planned_new_files,
                     repo_files=repo_files,
@@ -498,7 +517,7 @@ class ManualWorkflowController:
                 "Developer generate",
             )
         output = DeveloperOutput(**generation_response.json())
-        #validate_planned_changes(output, self.context["repo_files"])
+        validate_planned_changes(output, self.context["repo_files"])
         self.context["developer_output"] = output
         self.agents["developer"]["output"] = output.model_dump()
         self.agents["developer"]["files"] = {
@@ -578,7 +597,6 @@ class ManualWorkflowController:
                 "task": self.context["task"],
                 "ticket": ticket.model_dump(),
                 "planning_result": planning_result.model_dump(),
-                "likely_modules": list(dict.fromkeys(planning_result.likely_modules)),
                 "likely_existing_files": planned_existing_files,
                 "original_code": original_output.code,
                 "planned_new_files": planned_new_files,
@@ -596,7 +614,7 @@ class ManualWorkflowController:
             )
         improvement_message = AgentMessage(**improvement_response.json())
         improved_output = DeveloperOutput(**improvement_message.payload)
-        #validate_planned_changes(improved_output, repo_files)
+        validate_planned_changes(improved_output, repo_files)
 
         self.context["developer_output"] = improved_output
         self.agents["developer"]["output"] = improved_output.model_dump()
@@ -632,7 +650,7 @@ class ManualWorkflowController:
                 await post_or_raise(
                     client,
                     f"{KNOWLEDGE_SERVICE_URL}/update-knowledge",
-                    {"repository_path": repo.path, "changes": [change.model_dump() for change in output.changes]},
+                    {"repository_path": repo.path, "branch": branch.branch, "changes": [change.model_dump() for change in output.changes]},
                     "Knowledge update",
                 )
                 if self.open_pr:
@@ -1026,6 +1044,8 @@ async def workflow_send_edited_message(payload: dict[str, Any] = Body(...)) -> d
     return command_result("send-edited-message")
 
 
+
+
 @app.post("/work-on-ticket", response_model=GenerateResponse)
 async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
     messages: list[AgentMessage] = []
@@ -1041,6 +1061,23 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
 
     try:
         async with httpx.AsyncClient(timeout=60) as client:
+            # Sync all branch knowledge before starting any real work.
+            repo_response = await post_or_raise(
+                client,
+                f"{REPO_SERVICE_URL}/prepare-repo",
+                PrepareRepoRequest(repo_url=request.repo_url or None).model_dump(),
+                "Repo prepare",
+            )
+            # Use the prepared repo path for sync, then prepare again below
+            # (idempotent) before proceeding — the second call is cheap.
+            _pre_sync_repo = RepoInfo(**repo_response.json())
+            await post_or_raise(
+                client,
+                f"{KNOWLEDGE_SERVICE_URL}/sync-branches",
+                {"repository_path": _pre_sync_repo.path},
+                "Knowledge sync-branches",
+            )
+
             ticket_response = await client.get(
                 f"{JIRA_SERVICE_URL}/tickets/{request.issue_key}"
             )
@@ -1084,6 +1121,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                     "Repo create-branch",
                 )
                 branch = BranchResponse(**branch_response.json())
+
             messages.append(
                 AgentMessage(
                     sender="orchestrator_agent",
@@ -1096,7 +1134,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
             knowledge_response = await post_or_raise(
                 client,
                 f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
-                {"repository_path": repo.path},
+                {"repository_path": repo.path, "branch": branch.branch},
                 "Knowledge ensure",
             )
             knowledge = knowledge_response.json()
@@ -1162,7 +1200,6 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                     task=task,
                     ticket=ticket,
                     planning_result=planning_result,
-                    likely_modules=list(dict.fromkeys(planning_result.likely_modules)),
                     likely_existing_files=planned_existing_files,
                     planned_new_files=planned_new_files,
                     repo_files=repo_files,
@@ -1170,7 +1207,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 "Developer generate",
             )
             original_output = DeveloperOutput(**generation_response.json())
-            #validate_planned_changes(original_output, repo_files)
+            validate_planned_changes(original_output, repo_files)
 
             review_request = AgentMessage(
                 sender="orchestrator_agent",
@@ -1228,7 +1265,6 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                         "task": task,
                         "ticket": ticket.model_dump(),
                         "planning_result": planning_result.model_dump() if planning_result else None,
-                        "likely_modules": list(dict.fromkeys(planning_result.likely_modules)),
                         "likely_existing_files": planned_existing_files,
                         "original_code": original_output.code,
                         "planned_new_files": planned_new_files,
@@ -1249,7 +1285,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                 improvement_message = AgentMessage(**improvement_response.json())
                 messages.append(improvement_message)
                 improved_output = DeveloperOutput(**improvement_message.payload)
-                #validate_planned_changes(improved_output, repo_files)
+                validate_planned_changes(improved_output, repo_files)
             else:
                 improved_output = original_output
 
@@ -1303,6 +1339,7 @@ async def work_on_ticket(request: GenerateRequest) -> GenerateResponse:
                     f"{KNOWLEDGE_SERVICE_URL}/update-knowledge",
                     {
                         "repository_path": repo.path,
+                        "branch": branch.branch,
                         "changes": [change.model_dump() for change in improved_output.changes],
                     },
                     "Knowledge update",
