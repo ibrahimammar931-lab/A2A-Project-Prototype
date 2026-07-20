@@ -11,7 +11,25 @@ def _has_meaningful_content(content: str) -> bool:
 
 class GenerateRequest(BaseModel):
     issue_key: str
-    base_branch: str = "main"
+    # NOTE: intentionally "" rather than "main". A truthy default here means
+    # any caller that sends only existing_branch (without ALSO explicitly
+    # overriding base_branch="") gets rejected by validate_branch_exclusivity
+    # below, even though it never touched base_branch. The actual "main"
+    # default is applied downstream (see main.py) once we know which mode
+    # was requested.
+    base_branch: str = ""
+    existing_branch: str = ""
+    open_pr: bool = True
+    repo_url: str = ""
+
+    @model_validator(mode="after")
+    def validate_branch_exclusivity(self):
+        if self.base_branch and self.existing_branch:
+            raise ValueError(
+                "base_branch and existing_branch are mutually exclusive. "
+                "Provide exactly one."
+            )
+        return self
 
 
 class JiraTicket(BaseModel):
@@ -63,7 +81,6 @@ class PlanningResult(BaseModel):
     task_summary: str
     requirements: list[str] = Field(default_factory=list)
     implementation_steps: list[str] = Field(default_factory=list)
-    likely_modules: list[str] = Field(default_factory=list)
     likely_existing_files: list[str] = Field(default_factory=list)
     new_files: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
@@ -92,7 +109,6 @@ class AgentTaskRequest(BaseModel):
     task: str
     ticket: JiraTicket | None = None
     planning_result: PlanningResult | None = None
-    likely_modules: list[str] = Field(default_factory=list)
     likely_existing_files: list[str] = Field(default_factory=list)
     planned_new_files: list[str] = Field(default_factory=list)
     repo_files: list[RepoFile] = Field(default_factory=list)
