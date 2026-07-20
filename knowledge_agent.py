@@ -109,6 +109,33 @@ def _current_branch(repo_path: Path) -> str | None:
         return None
 
 
+def _read_file_at_commit(repo_path: Path, sha: str, path: str) -> str | None:
+    """Read a file's content directly from git's object store at a specific
+    commit, bypassing the working tree entirely.
+
+    IMPORTANT: this project applies Developer changes via the GitHub
+    Contents API (see the Repo service's ``apply_changes`` /
+    ``github_put_file``), not local ``git commit``/``git push``. That means
+    a local clone's checked-out working-tree files can go stale relative to
+    the real commit history — ``git fetch`` updates remote-tracking refs,
+    but nothing pulls the new file contents into the working directory.
+    Reading via ``git show <sha>:<path>`` instead reads straight from the
+    commit's tree object, so it is correct regardless of whether the
+    working tree has been refreshed.
+
+    Returns None if the path does not exist at that commit (e.g. it was
+    deleted), distinguishing "genuinely absent" from other read failures.
+    """
+    posix_path = path.replace("\\", "/")
+    try:
+        return _run_git(repo_path, ["show", f"{sha}:{posix_path}"])
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "does not exist" in message or "exists on disk, but not in" in message or "fatal: path" in message:
+            return None
+        raise
+
+
 # -- Knowledge agent -------------------------------------------------------
 
 class KnowledgeAgent:
@@ -167,7 +194,8 @@ class KnowledgeAgent:
                         branch,
                         known_parent,
                     )
-                    return self._copy_branch_knowledge(repository_path, known_parent, branch)
+                    self._copy_branch_knowledge(repository_path, known_parent, branch)
+                    return self.load_knowledge(repository_path, branch)
                 logger.info(
                     "Known parent '%s' has no knowledge either — falling back to full build for %s",
                     known_parent,
@@ -178,8 +206,20 @@ class KnowledgeAgent:
                     "Knowledge directory missing for branch %s and no known parent given — building from scratch",
                     branch,
                 )
-            metadata = self.build_knowledge(repository_path, branch)
-            return metadata
+            self.build_knowledge(repository_path, branch)
+            # NOTE: build_knowledge/_copy_branch_knowledge return the raw
+            # metadata dict (where "files" is an integer count). Callers of
+            # ensure_knowledge (e.g. the Planner) expect the same shape as
+            # load_knowledge returns (where "files" is a dict of per-file
+            # summaries keyed by path). Returning the raw metadata dict here
+            # caused an intermittent AttributeError downstream whenever
+            # knowledge had to be built or copied fresh this run, since
+            # `.get("files").keys()` only works on the dict shape — it
+            # worked "sometimes" because a branch with pre-existing
+            # knowledge took the load_knowledge path below instead and never
+            # hit this bug. Always route through load_knowledge here so
+            # ensure_knowledge has exactly one return shape, always.
+            return self.load_knowledge(repository_path, branch)
 
         logger.info("Loading existing knowledge for %s (branch %s)", repository_path, branch)
         return self.load_knowledge(repository_path, branch)
@@ -310,6 +350,17 @@ class KnowledgeAgent:
         """Update knowledge for the provided changed files only.
 
         Updates ``source_sha`` in metadata to the branch's current HEAD.
+
+        NOTE ON CONTENT SOURCE: when a change does not carry explicit
+        ``content`` (``content is None``), this reads the file from git's
+        object store at the branch's current commit (via
+        ``_read_file_at_commit`` / ``git show <sha>:<path>``) rather than
+        from the working-tree file on disk. This matters because changes
+        are applied via the GitHub Contents API (one commit per file,
+        directly on GitHub), not local ``git commit``/``git push`` — so the
+        local working tree is not guaranteed to reflect the latest commits
+        even after a ``git fetch``. Reading from the object store at the
+        known commit SHA is correct regardless of working-tree state.
         """
         repo = Path(repository_path).resolve()
         if not repo.exists():
@@ -317,6 +368,11 @@ class KnowledgeAgent:
 
         files_dir = self._files_dir(repository_path, branch)
         files_dir.mkdir(parents=True, exist_ok=True)
+
+        # Resolve once up front: every content=None read in this call uses
+        # this same commit, so all files summarized in one pass are
+        # consistent with a single, real point in the branch's history.
+        current_sha = _get_head_sha(repo, branch)
 
         updated = 0
         removed = 0
@@ -336,18 +392,35 @@ class KnowledgeAgent:
             if change.content is not None:
                 content = change.content
             else:
-                target_file = repo / rel_path
-                if not target_file.exists():
-                    # If the file no longer exists, remove knowledge if present
-                    if knowledge_file.exists():
-                        knowledge_file.unlink()
-                        removed += 1
+                if not current_sha:
+                    logger.warning(
+                        "Could not resolve current commit for branch %s — skipping %s",
+                        branch,
+                        change.path,
+                    )
                     continue
 
                 try:
-                    content = target_file.read_text(encoding="utf-8")
-                except Exception:
-                    logger.warning("Could not read changed file for knowledge update: %s", target_file)
+                    content = _read_file_at_commit(repo, current_sha, change.path)
+                except RuntimeError as exc:
+                    logger.warning(
+                        "Could not read %s at commit %s for knowledge update: %s",
+                        change.path,
+                        current_sha,
+                        exc,
+                    )
+                    continue
+
+                if content is None:
+                    # File does not exist at this commit — treat like a delete.
+                    if knowledge_file.exists():
+                        knowledge_file.unlink()
+                        removed += 1
+                        logger.info(
+                            "Removed knowledge for %s (not present at commit %s)",
+                            change.path,
+                            current_sha,
+                        )
                     continue
 
             knowledge = self._summarize_file(str(rel_path), content)
@@ -360,8 +433,10 @@ class KnowledgeAgent:
         metadata["generated_at"] = datetime.utcnow().isoformat() + "Z"
         metadata["branch"] = branch
 
-        # Record current HEAD as the new source_sha
-        source_sha = _get_head_sha(repo, branch) or metadata.get("source_sha", "unknown")
+        # Record current HEAD as the new source_sha (reuse the SHA resolved
+        # at the top of this call, so metadata reflects exactly the commit
+        # every content=None read in this call actually used)
+        source_sha = current_sha or metadata.get("source_sha", "unknown")
         metadata["source_sha"] = source_sha
 
         # Update files count
