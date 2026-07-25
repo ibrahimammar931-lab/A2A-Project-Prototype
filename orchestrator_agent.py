@@ -11,6 +11,7 @@ import httpx
 from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from available_models import AVAILABLE_MODELS
 from config import (
     DEVELOPER_SERVICE_URL,
     JIRA_SERVICE_URL,
@@ -459,7 +460,7 @@ class ManualWorkflowController:
             response = await post_or_raise(
                 client,
                 f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
-                {"repository_path": repo.path, "branch": branch.branch},
+                {"repository_path": repo.path, "branch": branch.branch, "model": current_model_selection.get("knowledge")},
                 "Knowledge ensure",
             )
         knowledge = response.json()
@@ -474,7 +475,7 @@ class ManualWorkflowController:
             response = await post_or_raise(
                 client,
                 f"{PLANNER_SERVICE_URL}/plan",
-                PlanningRequest(jira_ticket=ticket, project_knowledge=knowledge).model_dump(),
+                PlanningRequest(jira_ticket=ticket, project_knowledge=knowledge, model=current_model_selection.get("planner")).model_dump(),
                 "Planner plan",
             )
         planning_result = PlanningResult(**response.json())
@@ -513,6 +514,7 @@ class ManualWorkflowController:
                     likely_existing_files=planned_existing_files,
                     planned_new_files=planned_new_files,
                     repo_files=repo_files,
+                    model=current_model_selection.get("developer"),
                 ).model_dump(),
                 "Developer generate",
             )
@@ -529,6 +531,7 @@ class ManualWorkflowController:
 
     async def _run_reviewer(self) -> None:
         review_payload = self._latest_payload("Developer", "Reviewer") or self._review_payload()
+        review_payload["model"] = current_model_selection.get("reviewer")
         review_request = AgentMessage(
             sender="orchestrator_agent",
             receiver="reviewer_agent",
@@ -602,6 +605,7 @@ class ManualWorkflowController:
                 "planned_new_files": planned_new_files,
                 "review_feedback": filtered_feedback.model_dump(),
                 "repo_files": [repo_file.model_dump() for repo_file in repo_files],
+                "model": current_model_selection.get("developer"),
             },
         )
 
@@ -650,7 +654,7 @@ class ManualWorkflowController:
                 await post_or_raise(
                     client,
                     f"{KNOWLEDGE_SERVICE_URL}/update-knowledge",
-                    {"repository_path": repo.path, "branch": branch.branch, "changes": [change.model_dump() for change in output.changes]},
+                    {"repository_path": repo.path, "branch": branch.branch, "changes": [change.model_dump() for change in output.changes], "model": current_model_selection.get("knowledge")},
                     "Knowledge update",
                 )
                 if self.open_pr:
@@ -866,6 +870,62 @@ class ManualWorkflowController:
 manual_workflow = ManualWorkflowController()
 current_mode: str = "manual"  # "manual" or "automatic"
 
+# -- Model selection persistence (system-wide, survives reset()) ----------
+MODEL_SELECTION_FILE = "model_selection.json"
+AGENT_KEYS = ("knowledge", "planner", "developer", "reviewer")
+
+# Default fallback: each agent key maps to the service's own config.py
+# default, which is selected inside the agent itself when model=None is
+# received. We store None in the dictionary for agents where no override
+# has been picked yet, which lets agent-level fallback happen naturally.
+_model_selection_defaults: dict[str, str | None] = {
+    "knowledge": None,
+    "planner": None,
+    "developer": None,
+    "reviewer": None,
+}
+
+
+def _load_model_selection() -> dict[str, str | None]:
+    """Load persisted model selection from MODEL_SELECTION_FILE.
+
+    Returns a dict mapping each agent key to a LiteLLM model id, or None
+    if no override has been saved yet. Missing keys are filled with None
+    from _model_selection_defaults.
+    """
+    try:
+        raw = json.loads(open(MODEL_SELECTION_FILE, encoding="utf-8").read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return dict(_model_selection_defaults)
+
+    result: dict[str, str | None] = {}
+    for key in AGENT_KEYS:
+        val = raw.get(key)
+        if isinstance(val, str) and val.strip():
+            result[key] = val.strip()
+        else:
+            result[key] = None
+    return result
+
+
+def _save_model_selection(selection: dict[str, str | None]) -> None:
+    """Write the current model selection dict to MODEL_SELECTION_FILE."""
+    with open(MODEL_SELECTION_FILE, "w", encoding="utf-8") as f:
+        json.dump(selection, f, indent=2)
+
+
+current_model_selection: dict[str, str | None] = _load_model_selection()
+
+
+def _credentialed_model_ids() -> set[str]:
+    """Return the set of AVAILABLE_MODELS ids whose requires_env is set."""
+    credentialed: set[str] = set()
+    for entry in AVAILABLE_MODELS:
+        env_var = entry.get("requires_env", "")
+        if env_var and os.getenv(env_var):
+            credentialed.add(entry["id"])
+    return credentialed
+
 
 def command_result(command: str) -> dict[str, Any]:
     return {"command": command, "accepted": True, "timestamp": manual_workflow._now()}
@@ -1042,6 +1102,74 @@ async def workflow_send_edited_message(payload: dict[str, Any] = Body(...)) -> d
     manual_workflow.send_edited_message(payload["messageId"])
     await manual_workflow.broadcast()
     return command_result("send-edited-message")
+
+
+# -- Model selection endpoints ---------------------------------------------
+
+
+@app.get("/api/workflow/available-models")
+async def workflow_available_models() -> list[dict[str, str]]:
+    """Return the credentialed subset of AVAILABLE_MODELS.
+
+    Only entries whose ``requires_env`` environment variable is currently
+    set (non-empty) are included — the dashboard dropdown never shows an
+    option that would fail for lack of an API key.
+    """
+    return [
+        {"id": entry["id"], "label": entry["label"], "provider": entry["provider"]}
+        for entry in AVAILABLE_MODELS
+        if os.getenv(entry.get("requires_env", ""))
+    ]
+
+
+@app.get("/api/workflow/model-selection")
+async def workflow_get_model_selection() -> dict[str, str | None]:
+    """Return the current per-agent model selection dict.
+
+    A null value for an agent means "no override — use the agent's own
+    hardcoded default".
+    """
+    return dict(current_model_selection)
+
+
+@app.post("/api/workflow/model-selection")
+async def workflow_set_model_selection(payload: dict[str, Any] = Body(...)) -> dict[str, str | None]:
+    """Update per-agent model selection.
+
+    Accepts a partial dict — only keys present in the payload are updated;
+    omitted keys keep their current value. Validates that any provided
+    model id exists in AVAILABLE_MODELS AND is currently credentialed.
+    """
+    global current_model_selection
+    credentialed = _credentialed_model_ids()
+
+    updated = dict(current_model_selection)
+    for key in AGENT_KEYS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            # Explicitly clearing the override — store None to fall back to
+            # the agent's own default.
+            updated[key] = None
+            continue
+        if not isinstance(value, str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model id for '{key}' must be a string, got {type(value).__name__}",
+            )
+        model_id = value.strip()
+        if model_id not in credentialed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model_id}' is not available — it is either not in the "
+                f"AVAILABLE_MODELS list or its required API key is not configured.",
+            )
+        updated[key] = model_id
+
+    current_model_selection = updated
+    _save_model_selection(updated)
+    return dict(current_model_selection)
 
 
 

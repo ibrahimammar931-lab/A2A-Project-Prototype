@@ -75,6 +75,7 @@ class FileChange(BaseModel):
 class PlanningRequest(BaseModel):
     jira_ticket: JiraTicket
     project_knowledge: dict[str, Any]
+    model: str | None = None
 
 
 class PlanningResult(BaseModel):
@@ -112,6 +113,7 @@ class AgentTaskRequest(BaseModel):
     likely_existing_files: list[str] = Field(default_factory=list)
     planned_new_files: list[str] = Field(default_factory=list)
     repo_files: list[RepoFile] = Field(default_factory=list)
+    model: str | None = None
 
 
 class DeveloperOutput(BaseModel):

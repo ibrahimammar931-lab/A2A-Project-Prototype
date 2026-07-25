@@ -8,8 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
+import litellm
 from fastapi import FastAPI, HTTPException
-from openai import OpenAI
 
 from config import GROQ_API_KEY, GROQ_MODEL, check_config, configure_logging
 from schemas import FileChange
@@ -141,7 +141,7 @@ def _read_file_at_commit(repo_path: Path, sha: str, path: str) -> str | None:
 class KnowledgeAgent:
     def __init__(self) -> None:
         check_config()
-        self.client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+        self.model = GROQ_MODEL
 
     # -- Branch-scoped directory helpers -----------------------------------
 
@@ -173,6 +173,7 @@ class KnowledgeAgent:
         repository_path: str,
         branch: str,
         known_parent: str | None = None,
+        model: str | None = None,
     ) -> Dict[str, Any]:
         """Return loaded knowledge; build (or copy from a known parent) if missing.
 
@@ -206,7 +207,7 @@ class KnowledgeAgent:
                     "Knowledge directory missing for branch %s and no known parent given — building from scratch",
                     branch,
                 )
-            self.build_knowledge(repository_path, branch)
+            self.build_knowledge(repository_path, branch, model=model)
             # NOTE: build_knowledge/_copy_branch_knowledge return the raw
             # metadata dict (where "files" is an integer count). Callers of
             # ensure_knowledge (e.g. the Planner) expect the same shape as
@@ -224,7 +225,7 @@ class KnowledgeAgent:
         logger.info("Loading existing knowledge for %s (branch %s)", repository_path, branch)
         return self.load_knowledge(repository_path, branch)
 
-    def build_knowledge(self, repository_path: str, branch: str) -> Dict[str, Any]:
+    def build_knowledge(self, repository_path: str, branch: str, model: str | None = None) -> Dict[str, Any]:
         """Scan repository and build per-file knowledge artifacts (do not store code).
 
         Records the current HEAD commit SHA as ``source_sha`` in metadata
@@ -269,7 +270,7 @@ class KnowledgeAgent:
                 continue
 
             rel = path.relative_to(repo)
-            knowledge = self._summarize_file(str(rel), content)
+            knowledge = self._summarize_file(str(rel), content, model=model)
 
             out_path = files_dir / rel
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -346,7 +347,7 @@ class KnowledgeAgent:
         )
         return metadata
 
-    def update_knowledge(self, repository_path: str, branch: str, changes: List[FileChange]) -> Dict[str, Any]:
+    def update_knowledge(self, repository_path: str, branch: str, changes: List[FileChange], model: str | None = None) -> Dict[str, Any]:
         """Update knowledge for the provided changed files only.
 
         Updates ``source_sha`` in metadata to the branch's current HEAD.
@@ -423,7 +424,7 @@ class KnowledgeAgent:
                         )
                     continue
 
-            knowledge = self._summarize_file(str(rel_path), content)
+            knowledge = self._summarize_file(str(rel_path), content, model=model)
             knowledge_file.parent.mkdir(parents=True, exist_ok=True)
             knowledge_file.write_text(json.dumps(knowledge, ensure_ascii=False, indent=2), encoding="utf-8")
             updated += 1
@@ -675,17 +676,8 @@ class KnowledgeAgent:
 
     # -- Summarization (LLM) ----------------------------------------------
 
-    def _summarize_file(self, rel_path: str, content: str) -> Dict[str, Any]:
-        """Call the local LLM to summarize a single file into structured knowledge.
-
-        NOTE (markdown test): the outer envelope stays JSON — path/classes/
-        functions/imports/exports/metadata remain addressable fields, since
-        update_knowledge and the dashboard's json-viewer key off them
-        individually. Only `summary` (the field actually consumed as prose
-        by the Planner's prompt) is now requested as Markdown instead of a
-        plain string, to test whether the Planner reasons better/cheaper
-        over structured prose vs. flat text.
-        """
+    def _summarize_file(self, rel_path: str, content: str, model: str | None = None) -> Dict[str, Any]:
+        """Call the LLM via LiteLLM to summarize a single file into structured knowledge."""
         system = (
             "You are a project knowledge extractor. Read the file contents and produce a concise, "
             "structured JSON summary. Do NOT output source code or store the file contents. "
@@ -721,18 +713,19 @@ class KnowledgeAgent:
         )
 
         try:
-            response = self.client.chat.completions.create(
-                model=GROQ_MODEL,
+            selected_model = model or self.model  # override from orchestrator, or fallback default
+            response = litellm.completion(
+                model=selected_model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user_prompt}],
                 temperature=0.0,
                 response_format={"type": "json_object"},
             )
 
-            content = response.choices[0].message.content
-            if not content:
+            response_content = response.choices[0].message.content
+            if not response_content:
                 raise ValueError("Empty model response")
 
-            data = json.loads(content)
+            data = json.loads(response_content)
             # Ensure required keys and types
             result = {
                 "path": rel_path,
@@ -747,10 +740,11 @@ class KnowledgeAgent:
             return result
         except Exception as exc:
             logger.warning("LLM summarization failed for %s: %s", rel_path, exc)
-            # Fallback simple extractor
-            imports = []
-            functions = []
-            classes = []
+            # Fallback simple extractor — works on the file content
+            # (method param `content`), not the LLM response.
+            imports: list[str] = []
+            functions: list[str] = []
+            classes: list[str] = []
             for line in content.splitlines():
                 line = line.strip()
                 if line.startswith("import ") or line.startswith("from "):
@@ -766,8 +760,6 @@ class KnowledgeAgent:
             return {
                 "path": rel_path,
                 "file_purpose": "",
-                # Fallback path has no LLM available to format markdown, so this
-                # stays plain text — it's a degraded-mode result, not the tested format.
                 "summary": fallback_summary,
                 "classes": classes,
                 "functions": functions,
@@ -789,7 +781,8 @@ def ensure_knowledge_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
         repository_path = payload["repository_path"]
         branch = payload["branch"]
         known_parent = payload.get("known_parent")
-        return agent.ensure_knowledge(repository_path, branch, known_parent)
+        model = payload.get("model")
+        return agent.ensure_knowledge(repository_path, branch, known_parent, model=model)
     except Exception as exc:
         logger.exception("ensure_knowledge failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -800,7 +793,8 @@ def build_knowledge_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         repository_path = payload["repository_path"]
         branch = payload["branch"]
-        return agent.build_knowledge(repository_path, branch)
+        model = payload.get("model")
+        return agent.build_knowledge(repository_path, branch, model=model)
     except Exception as exc:
         logger.exception("build_knowledge failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -811,8 +805,9 @@ def update_knowledge_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         repository_path = payload["repository_path"]
         branch = payload["branch"]
+        model = payload.get("model")
         changes = [FileChange(**c) for c in payload.get("changes", [])]
-        return agent.update_knowledge(repository_path, branch, changes)
+        return agent.update_knowledge(repository_path, branch, changes, model=model)
     except Exception as exc:
         logger.exception("update_knowledge failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc

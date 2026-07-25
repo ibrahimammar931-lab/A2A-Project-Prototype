@@ -19,6 +19,8 @@ export class WorkflowStateService {
   readonly agents = computed(() => this.snapshot().agents);
   readonly messages = computed(() => this.snapshot().messages);
   readonly activePath = computed(() => this.snapshot().activePath);
+  readonly availableModels = signal<{ id: string; label: string; provider: string }[]>([]);
+  readonly modelSelection = signal<Record<string, string>>({});
   readonly currentMode = signal<WorkflowMode>('manual');
   readonly isManualMode = computed(() => this.currentMode() === 'manual');
   readonly isAutomaticMode = computed(() => this.currentMode() === 'automatic');
@@ -78,6 +80,24 @@ export class WorkflowStateService {
     ).subscribe((result) => {
       this.currentMode.set(result.mode);
     });
+  }
+
+  loadAvailableModels(): void {
+    this.http.get<{ id: string; label: string; provider: string }[]>(`${API_BASE}/available-models`).pipe(
+      catchError(() => of([]))
+    ).subscribe((models) => this.availableModels.set(models));
+  }
+
+  loadModelSelection(): void {
+    this.http.get<Record<string, string>>(`${API_BASE}/model-selection`).pipe(
+      catchError(() => of({}))
+    ).subscribe((selection) => this.modelSelection.set(selection));
+  }
+
+  saveModelSelection(selection: Partial<Record<string, string>>): void {
+    this.http.post<Record<string, string>>(`${API_BASE}/model-selection`, selection).pipe(
+      catchError(() => of(this.modelSelection()))
+    ).subscribe((updated) => this.modelSelection.set(updated));
   }
 
   toggleMode(): void {

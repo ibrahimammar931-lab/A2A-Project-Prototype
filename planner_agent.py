@@ -2,8 +2,8 @@ import json
 import logging
 from typing import Any
 
+import litellm
 from fastapi import FastAPI, HTTPException
-from openai import OpenAI
 
 from config import (
     GROQ_API_KEY,
@@ -33,15 +33,12 @@ class PlannerAgent:
     def __init__(self) -> None:
         check_config()
         self.model = GROQ_PLANNER_MODEL
-        self.client = OpenAI(
-            api_key=GROQ_API_KEY,
-            base_url="https://api.groq.com/openai/v1",
-        )
 
     def plan_task(
         self,
         jira_ticket: JiraTicket,
         project_knowledge: dict[str, Any],
+        model: str | None = None,
     ) -> PlanningResult:
         logger.info("Planner agent planning ticket %s", jira_ticket.key)
         prompt = (
@@ -79,8 +76,9 @@ class PlannerAgent:
             f"Project knowledge:\n{json.dumps(project_knowledge, indent=2)}"
         )
 
-        response = self.client.chat.completions.create(
-            model=self.model,
+        selected_model = model or self.model  # override from orchestrator, or fallback default
+        response = litellm.completion(
+            model=selected_model,
             messages=[
                 {
                     "role": "system",
@@ -129,14 +127,14 @@ class PlannerAgent:
 agent = PlannerAgent()
 
 
-def plan_task(jira_ticket: JiraTicket, project_knowledge: dict[str, Any]) -> PlanningResult:
-    return agent.plan_task(jira_ticket, project_knowledge)
+def plan_task(jira_ticket: JiraTicket, project_knowledge: dict[str, Any], model: str | None = None) -> PlanningResult:
+    return agent.plan_task(jira_ticket, project_knowledge, model=model)
 
 
 @app.post("/plan", response_model=PlanningResult)
 def plan(payload: PlanningRequest) -> PlanningResult:
     try:
-        return plan_task(payload.jira_ticket, payload.project_knowledge)
+        return plan_task(payload.jira_ticket, payload.project_knowledge, model=payload.model)
     except ValueError as exc:
         logger.warning("Planner validation failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
