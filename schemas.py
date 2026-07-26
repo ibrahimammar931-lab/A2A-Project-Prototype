@@ -207,6 +207,14 @@ class CreateBranchRequest(BaseModel):
 class ReadFilesRequest(BaseModel):
     repo_url: str
     paths: list[str]
+    # NOTE: added to fix a real bug — without knowing which branch to read
+    # from, /read-files had no way to guarantee it was looking at the
+    # right branch's content, and (separately) no way to know which
+    # branch's remote ref to sync the working tree against before
+    # reading. Optional (defaulting to None) so any other existing caller
+    # that doesn't pass it keeps working exactly as before, falling back
+    # to whatever is currently checked out.
+    branch: str | None = None
 
 
 class ReadFilesResponse(BaseModel):

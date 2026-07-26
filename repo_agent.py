@@ -307,6 +307,33 @@ def unique_branch_name(repo_path: Path, branch: str) -> str:
 
 
 def checkout_branch(repo_path: Path, branch: str) -> None:
+    """Check out *branch* and guarantee the working tree matches origin.
+
+    IMPORTANT: changes in this project are applied via the GitHub Contents
+    API (see apply_changes / github_put_file_with_retry below), not local
+    `git commit` + `git push`. That means commits can land on a branch on
+    GitHub's side with the local clone never having pulled them down — a
+    plain `git checkout <branch>` only switches which local ref is active,
+    it does NOT fast-forward that ref to match origin's latest commit. A
+    stale local branch then makes downstream reads (e.g. /read-files) fail
+    with "File does not exist" for a file that genuinely exists in the
+    repo's real history, simply because it was never pulled into this
+    particular working tree.
+
+    To fix this at the root rather than patching every read path
+    individually, this function always ends with a hard reset to
+    origin/<branch> after checkout, so the working tree is guaranteed to
+    reflect the branch's true remote state every time it's checked out —
+    regardless of whether this is the first checkout, a re-checkout of an
+    existing local branch, or a branch that's had commits land via the
+    GitHub API since the last time this local clone touched it.
+
+    This discards any local-only, uncommitted changes on that branch. That
+    is intentional and safe for this project: nothing in this codebase
+    writes directly to the working tree and relies on those writes
+    surviving un-pushed — all real changes go through the GitHub Contents
+    API, which means the remote is always the source of truth.
+    """
     run_git(repo_path, ["fetch", "origin", "--prune"])
     try:
         run_git(repo_path, ["fetch", "origin", branch])
@@ -317,6 +344,23 @@ def checkout_branch(repo_path: Path, branch: str) -> None:
         run_git(repo_path, ["checkout", branch])
     else:
         run_git(repo_path, ["checkout", "-b", branch, f"origin/{branch}"])
+
+    # Hard-reset to match the remote exactly. If origin/<branch> isn't
+    # resolvable (e.g. a brand-new branch that hasn't been pushed at all
+    # yet), skip the reset rather than failing — the freshly created local
+    # branch is already correct in that case, there's simply nothing on
+    # the remote yet to reset against.
+    try:
+        run_git(repo_path, ["rev-parse", "--verify", f"refs/remotes/origin/{branch}"])
+    except RuntimeError:
+        logger.debug(
+            "origin/%s not resolvable yet (branch not pushed?) — skipping hard reset",
+            branch,
+        )
+        return
+
+    run_git(repo_path, ["reset", "--hard", f"origin/{branch}"])
+    logger.info("Working tree for %s hard-reset to origin/%s", repo_path, branch)
 
 
 def build_commit_message(issue_key: str, summary: str, body: str | None) -> str:
@@ -469,12 +513,25 @@ def read_files(request: ReadFilesRequest) -> ReadFilesResponse:
     try:
         repo_id = repo_id_from_url(request.repo_url)
         repo_path = existing_repo_path(repo_id)
-        files = []
 
+        # FIX: previously this read directly from whatever happened to be
+        # checked out, with no branch awareness and no guarantee the
+        # working tree was up to date with the remote. Changes applied via
+        # the GitHub Contents API never touch the local working tree, so a
+        # file that was genuinely created/committed moments ago could be
+        # completely absent on disk here. If a branch was specified,
+        # explicitly check it out (which now also hard-resets to
+        # origin/<branch> — see checkout_branch) before reading, so the
+        # working tree is guaranteed current before any file is read.
+        if request.branch:
+            checkout_branch(repo_path, request.branch)
+
+        files = []
         for path in request.paths:
             file_path = safe_repo_file(repo_path, path)
             if not file_path.is_file():
-                raise ValueError(f"File does not exist: {path}")
+                branch_note = f" on branch '{request.branch}'" if request.branch else ""
+                raise ValueError(f"File does not exist{branch_note}: {path}")
             files.append(RepoFile(path=path, content=file_path.read_text(encoding="utf-8")))
 
         return ReadFilesResponse(repo_id=repo_id, files=files)

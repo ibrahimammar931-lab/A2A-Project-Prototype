@@ -488,6 +488,7 @@ class ManualWorkflowController:
     async def _run_developer(self) -> None:
         ticket: JiraTicket = self.context["ticket"]
         repo: RepoInfo = self.context["repo"]
+        branch: BranchResponse = self.context["branch"]
         planning_result = self._current_planning_result()
         planned_existing_files = list(dict.fromkeys(planning_result.likely_existing_files))
         planned_new_files = list(dict.fromkeys(planning_result.new_files))
@@ -498,7 +499,21 @@ class ManualWorkflowController:
                 files_response = await post_or_raise(
                     client,
                     f"{REPO_SERVICE_URL}/read-files",
-                    ReadFilesRequest(repo_url=repo.remote_url, paths=planned_existing_files).model_dump(),
+                    # FIX: pass branch so the Repo service (a) knows which
+                    # branch's content to read, and (b) can hard-reset its
+                    # working tree to match that branch's remote state
+                    # before reading — see checkout_branch's updated
+                    # docstring in repo_agent.py. Without this, a file
+                    # committed via the GitHub Contents API moments earlier
+                    # (or on a prior run) could be genuinely absent from
+                    # this local clone's working tree and fail with
+                    # "File does not exist" despite existing in the repo's
+                    # real history.
+                    ReadFilesRequest(
+                        repo_url=repo.remote_url,
+                        paths=planned_existing_files,
+                        branch=branch.branch,
+                    ).model_dump(),
                     "Repo read-files",
                 )
                 repo_files = ReadFilesResponse(**files_response.json()).files
@@ -1170,7 +1185,3 @@ async def workflow_set_model_selection(payload: dict[str, Any] = Body(...)) -> d
     current_model_selection = updated
     _save_model_selection(updated)
     return dict(current_model_selection)
-
-
-
-

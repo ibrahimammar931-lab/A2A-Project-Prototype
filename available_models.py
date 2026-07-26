@@ -30,33 +30,33 @@ class AvailableModel(TypedDict):
 
 AVAILABLE_MODELS: list[AvailableModel] = [
     {
+        "id": "groq/llama-3.3-70b-versatile",
+        "label": "llama-3.3-70b-versatile (Groq, fast/cheap)",
+        "provider": "groq",
+        "requires_env": "GROQ_API_KEY",
+    },
+    {
+        "id": "deepseek/deepseek-v4-pro",
+        "label": "DeepSeek V4 Pro (DeepSeek, strong reasoning/coding)",
+        "provider": "deepseek",
+        "requires_env": "DEEPSEEK_API_KEY",
+    },
+    {
         "id": "groq/openai/gpt-oss-20b",
-        "label": "GPT-OSS 20B (Groq, fast/cheap)",
+        "label": "GPT-OSS 20B (Groq, balanced)",
         "provider": "groq",
         "requires_env": "GROQ_API_KEY",
     },
     {
-        "id": "groq/openai/gpt-oss-120b",
-        "label": "GPT-OSS 120B (Groq, balanced)",
-        "provider": "groq",
-        "requires_env": "GROQ_API_KEY",
+        "id": "gemini/gemini-2.5-flash",
+        "label": "Gemini 2.5 Flash (Google, strong reasoning/coding)",
+        "provider": "gemini",
+        "requires_env": "GOOGLE_API_KEY",
     },
     {
-        "id": "groq/qwen/qwen3-32b",
-        "label": "Qwen3 32B (Groq, strong reasoning)",
-        "provider": "groq",
-        "requires_env": "GROQ_API_KEY",
-    },
-    {
-        "id": "anthropic/claude-3-5-haiku-latest",
-        "label": "Claude 3.5 Haiku (Anthropic)",
-        "provider": "anthropic",
-        "requires_env": "ANTHROPIC_API_KEY",
-    },
-    {
-        "id": "openai/gpt-4o-mini",
-        "label": "GPT-4o mini (OpenAI)",
-        "provider": "openai",
-        "requires_env": "OPENAI_API_KEY",
+        "id": "deepseek/deepseek-v4-flash",
+        "label": "DeepSeek V4 Flash (DeepSeek, fast/cheap)",
+        "provider": "deepseek",
+        "requires_env": "DEEPSEEK_API_KEY",
     },
 ]
