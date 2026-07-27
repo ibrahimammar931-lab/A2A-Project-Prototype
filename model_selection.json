@@ -1,6 +1,6 @@
 {
   "knowledge": "groq/llama-3.3-70b-versatile",
-  "planner": "deepseek/deepseek-v4-flash",
+  "planner": "groq/llama-3.3-70b-versatile",
   "developer": "deepseek/deepseek-v4-pro",
   "reviewer": "deepseek/deepseek-v4-flash"
 }

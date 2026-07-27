@@ -460,7 +460,12 @@ class ManualWorkflowController:
             response = await post_or_raise(
                 client,
                 f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
-                {"repository_path": repo.path, "branch": branch.branch, "model": current_model_selection.get("knowledge")},
+                {
+                    "repository_path": repo.path,
+                    "branch": branch.branch,
+                    "known_parent": branch.base_branch,
+                    "model": current_model_selection.get("knowledge"),
+                },
                 "Knowledge ensure",
             )
         knowledge = response.json()
@@ -1066,11 +1071,13 @@ async def workflow_restart(payload: dict[str, Any] = Body(default_factory=dict))
     issue_key = payload["issue_key"] if "issue_key" in payload else manual_workflow.issue_key
     base_branch = payload["base_branch"] if "base_branch" in payload else manual_workflow.base_branch
     existing_branch = payload["existing_branch"] if "existing_branch" in payload else manual_workflow.existing_branch
+    repo_url = payload["repo_url"] if "repo_url" in payload else manual_workflow.repo_url
     manual_workflow.reset(
         issue_key=issue_key,
         base_branch=base_branch,
         existing_branch=existing_branch,
         open_pr=payload.get("open_pr") if "open_pr" in payload else manual_workflow.open_pr,
+        repo_url=repo_url,
     )
     await manual_workflow.broadcast()
     return command_result("restart")
