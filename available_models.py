@@ -26,6 +26,8 @@ class AvailableModel(TypedDict):
     label: str
     provider: str
     requires_env: str
+    capabilities: str
+    power: int
 
 
 AVAILABLE_MODELS: list[AvailableModel] = [
@@ -34,29 +36,39 @@ AVAILABLE_MODELS: list[AvailableModel] = [
         "label": "llama-3.3-70b-versatile (Groq, fast/cheap)",
         "provider": "groq",
         "requires_env": "GROQ_API_KEY",
+        "capabilities": "general-purpose, instruction-following, code generation, reasoning",
+        "power": 3,
     },
     {
         "id": "deepseek/deepseek-v4-pro",
         "label": "DeepSeek V4 Pro (DeepSeek, strong reasoning/coding)",
         "provider": "deepseek",
         "requires_env": "DEEPSEEK_API_KEY",
+        "capabilities": "strong reasoning, advanced coding, structured output, code review",
+        "power": 5,
     },
     {
         "id": "groq/openai/gpt-oss-20b",
         "label": "GPT-OSS 20B (Groq, balanced)",
         "provider": "groq",
         "requires_env": "GROQ_API_KEY",
+        "capabilities": "general-purpose, balanced performance, code generation",
+        "power": 2,
     },
     {
         "id": "gemini/gemini-2.5-flash",
         "label": "Gemini 2.5 Flash (Google, strong reasoning/coding)",
         "provider": "gemini",
         "requires_env": "GOOGLE_API_KEY",
+        "capabilities": "strong reasoning, code generation, fast inference, code review",
+        "power": 4,
     },
     {
         "id": "deepseek/deepseek-v4-flash",
         "label": "DeepSeek V4 Flash (DeepSeek, fast/cheap)",
         "provider": "deepseek",
         "requires_env": "DEEPSEEK_API_KEY",
+        "capabilities": "fast inference, code generation, instruction-following",
+        "power": 2,
     },
 ]

@@ -32,8 +32,8 @@ import { WorkflowStateService } from '../../services/workflow-state.service';
               <p>The workflow is running automatically. All agents will execute without requiring manual approval.</p>
             </section>
           }
-          <app-model-selection-panel />
           <app-pipeline-graph />
+          <app-model-selection-panel />
         </main>
       </mat-drawer-content>
       <mat-drawer mode="side" position="end" opened>

@@ -1,9 +1,10 @@
-import { Component, inject, OnInit } from '@angular/core';
+import { Component, computed, inject, OnInit } from '@angular/core';
 import { UpperCasePipe } from '@angular/common';
 import { MatCardModule } from '@angular/material/card';
 import { MatSelectModule } from '@angular/material/select';
 import { MatButtonModule } from '@angular/material/button';
 import { MatIconModule } from '@angular/material/icon';
+import { MatSlideToggleModule } from '@angular/material/slide-toggle';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { FormsModule } from '@angular/forms';
 import { WorkflowStateService } from '../../services/workflow-state.service';
@@ -22,7 +23,7 @@ const AGENT_LABELS: Record<string, string> = {
 @Component({
   selector: 'app-model-selection-panel',
   standalone: true,
-  imports: [UpperCasePipe, MatCardModule, MatSelectModule, MatButtonModule, MatIconModule, MatSnackBarModule, FormsModule],
+  imports: [UpperCasePipe, MatCardModule, MatSelectModule, MatButtonModule, MatIconModule, MatSlideToggleModule, MatSnackBarModule, FormsModule],
   template: `
     <mat-card class="model-panel">
       <mat-card-header>
@@ -31,7 +32,11 @@ const AGENT_LABELS: Record<string, string> = {
           Agent Model Selection
         </mat-card-title>
         <mat-card-subtitle>
-          Choose which model each agent uses. Changes persist across workflow runs.
+          @if (workflow.autoModelSelection()) {
+            🤖 Auto mode — the LLM-based Model Selector picks models per workflow run.
+          } @else {
+            Choose which model each agent uses. Changes persist across workflow runs.
+          }
         </mat-card-subtitle>
       </mat-card-header>
       <mat-card-content class="panel-grid">
@@ -41,10 +46,11 @@ const AGENT_LABELS: Record<string, string> = {
             <mat-form-field appearance="outline" class="model-select">
               <mat-select
                 [(ngModel)]="selections[agentKey]"
-                placeholder="Default (service config)"
+                placeholder="Auto-selected"
+                [disabled]="workflow.autoModelSelection()"
               >
                 <mat-option [value]="''">
-                  Default (service config)
+                  Auto-selected
                 </mat-option>
                 @for (model of groupedModels(); track model.id) {
                   <mat-option [value]="model.id">
@@ -57,7 +63,7 @@ const AGENT_LABELS: Record<string, string> = {
         }
       </mat-card-content>
       <mat-card-actions align="end">
-        <button mat-flat-button color="primary" (click)="save()">
+        <button mat-flat-button color="primary" (click)="save()" [disabled]="workflow.autoModelSelection()">
           <mat-icon>save</mat-icon>
           Save Selection
         </button>
@@ -109,7 +115,7 @@ const AGENT_LABELS: Record<string, string> = {
   `],
 })
 export class ModelSelectionPanelComponent implements OnInit {
-  private readonly workflow = inject(WorkflowStateService);
+  readonly workflow = inject(WorkflowStateService);
   private readonly snackBar = inject(MatSnackBar);
 
   readonly agentKeys = [...AGENT_DISPLAY_ORDER];

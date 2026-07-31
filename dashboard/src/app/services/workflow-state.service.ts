@@ -24,6 +24,8 @@ export class WorkflowStateService {
   readonly currentMode = signal<WorkflowMode>('manual');
   readonly isManualMode = computed(() => this.currentMode() === 'manual');
   readonly isAutomaticMode = computed(() => this.currentMode() === 'automatic');
+  readonly autoModelSelection = signal<boolean>(false);
+  readonly isAutoModelMode = computed(() => this.autoModelSelection());
   readonly selectedAgent = computed(() => {
     const selectedId = this.selectedAgentId();
     return this.snapshot().agents.find((agent) => agent.id === selectedId) ?? null;
@@ -98,6 +100,22 @@ export class WorkflowStateService {
     this.http.post<Record<string, string>>(`${API_BASE}/model-selection`, selection).pipe(
       catchError(() => of(this.modelSelection()))
     ).subscribe((updated) => this.modelSelection.set(updated));
+  }
+
+  fetchAutoModelSelection(): void {
+    this.http.get<{ enabled: boolean }>(`${API_BASE}/auto-model-selection`).pipe(
+      catchError(() => of({ enabled: false }))
+    ).subscribe((result) => {
+      this.autoModelSelection.set(result.enabled);
+    });
+  }
+
+  setAutoModelSelection(enabled: boolean): void {
+    this.http.post<{ enabled: boolean }>(`${API_BASE}/set-auto-model-selection`, { enabled }).pipe(
+      catchError(() => of({ enabled: this.autoModelSelection() }))
+    ).subscribe((result) => {
+      this.autoModelSelection.set(result.enabled);
+    });
   }
 
   toggleMode(): void {

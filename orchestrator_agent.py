@@ -16,6 +16,7 @@ from config import (
     DEVELOPER_SERVICE_URL,
     JIRA_SERVICE_URL,
     KNOWLEDGE_SERVICE_URL,
+    MODEL_SELECTOR_SERVICE_URL,
     PLANNER_SERVICE_URL,
     REPO_SERVICE_URL,
     REVIEWER_SERVICE_URL,
@@ -889,10 +890,12 @@ class ManualWorkflowController:
 
 manual_workflow = ManualWorkflowController()
 current_mode: str = "manual"  # "manual" or "automatic"
+auto_model_selection: bool = False  # gated by /api/workflow/auto-model-selection
 
 # -- Model selection persistence (system-wide, survives reset()) ----------
 MODEL_SELECTION_FILE = "model_selection.json"
 AGENT_KEYS = ("knowledge", "planner", "developer", "reviewer")
+ALL_MODEL_SELECTION_KEYS = ("knowledge", "planner", "developer", "reviewer", "model_selector")
 
 # Default fallback: each agent key maps to the service's own config.py
 # default, which is selected inside the agent itself when model=None is
@@ -903,6 +906,7 @@ _model_selection_defaults: dict[str, str | None] = {
     "planner": None,
     "developer": None,
     "reviewer": None,
+    "model_selector": None,
 }
 
 
@@ -919,7 +923,7 @@ def _load_model_selection() -> dict[str, str | None]:
         return dict(_model_selection_defaults)
 
     result: dict[str, str | None] = {}
-    for key in AGENT_KEYS:
+    for key in ALL_MODEL_SELECTION_KEYS:
         val = raw.get(key)
         if isinstance(val, str) and val.strip():
             result[key] = val.strip()
@@ -929,9 +933,13 @@ def _load_model_selection() -> dict[str, str | None]:
 
 
 def _save_model_selection(selection: dict[str, str | None]) -> None:
-    """Write the current model selection dict to MODEL_SELECTION_FILE."""
+    """Write the current model selection dict to MODEL_SELECTION_FILE.
+    Only persists keys in ALL_MODEL_SELECTION_KEYS."""
+    out: dict[str, str | None] = {}
+    for key in ALL_MODEL_SELECTION_KEYS:
+        out[key] = selection.get(key)
     with open(MODEL_SELECTION_FILE, "w", encoding="utf-8") as f:
-        json.dump(selection, f, indent=2)
+        json.dump(out, f, indent=2)
 
 
 current_model_selection: dict[str, str | None] = _load_model_selection()
@@ -1001,6 +1009,138 @@ async def workflow_get_mode() -> dict[str, Any]:
     return {"mode": current_mode}
 
 
+HEALTH_CHECK_PROMPT = "Say the word healthy and nothing else."
+HEALTH_CHECK_TIMEOUT = 15
+
+
+async def _check_model_health(model_id: str) -> bool:
+    """Single-shot LiteLLM health ping from the orchestrator.
+
+    Kept separate from the Model Selector's own health check so the
+    orchestrator can pre-filter candidates without depending on the
+    selector being available.
+    """
+    import litellm
+
+    try:
+        response = litellm.completion(
+            model=model_id,
+            messages=[{"role": "user", "content": HEALTH_CHECK_PROMPT}],
+            max_tokens=5,
+            timeout=HEALTH_CHECK_TIMEOUT,
+        )
+        return bool(response and response.choices)
+    except Exception:
+        return False
+
+
+async def _run_model_selection() -> None:
+    """Call the Model Selector agent and persist its returned assignments.
+
+    Only overwrites the 4 agent keys (knowledge, planner, developer,
+    reviewer).  The ``model_selector`` key is overwritten only when the
+    selector agent reports that it was forced to swap to a different model
+    (i.e. ``selector_swapped`` is true).
+
+    Every candidate model is health-checked **before** the list is sent to
+    the selector — only models that respond to a trivial ping are included.
+    """
+    global current_model_selection
+
+    # Build candidate list from credentialed AVAILABLE_MODELS enriched with
+    # capabilities and power so the selector has all the context it needs.
+    credentialed = _credentialed_model_ids()
+    all_candidates = [
+        {
+            "id": entry["id"],
+            "label": entry["label"],
+            "capabilities": entry.get("capabilities", "unknown"),
+            "power": entry.get("power", 1),
+        }
+        for entry in AVAILABLE_MODELS
+        if entry["id"] in credentialed
+    ]
+
+    if not all_candidates:
+        logger.warning("No credentialed models available — skipping model selection")
+        return
+
+    # ---- Health-check every candidate; only keep the healthy ones -------
+    manual_workflow.current_action = "Health-checking candidate models..."
+    await manual_workflow.broadcast()
+
+    healthy_candidates: list[dict] = []
+    unhealthy: list[str] = []
+    for c in all_candidates:
+        cid = c["id"]
+        if await _check_model_health(cid):
+            healthy_candidates.append(c)
+            logger.info("Candidate %s is healthy", cid)
+        else:
+            unhealthy.append(cid)
+            logger.warning("Candidate %s is unhealthy — excluded from selection", cid)
+
+    if not healthy_candidates:
+        logger.warning("All candidate models failed health checks — skipping model selection")
+        return
+
+    if unhealthy:
+        logger.info(
+            "Filtered %d unhealthy candidates: %s",
+            len(unhealthy),
+            ", ".join(unhealthy),
+        )
+
+    # ---- Ensure a model_selector model is configured -------------------
+    configured_selector = current_model_selection.get("model_selector")
+    if not configured_selector or configured_selector not in {c["id"] for c in healthy_candidates}:
+        configured_selector = healthy_candidates[0]["id"]
+        current_model_selection["model_selector"] = configured_selector
+        _save_model_selection(current_model_selection)
+
+    ticket: JiraTicket | None = manual_workflow.context.get("ticket")
+    ticket_text = ticket_to_task(ticket) if ticket else ""
+
+    payload = {
+        "ticket": ticket_text,
+        "candidates": healthy_candidates,
+        "current_selection": dict(current_model_selection),
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        try:
+            response = await client.post(
+                f"{MODEL_SELECTOR_SERVICE_URL}/select-models",
+                json=payload,
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            logger.exception("Model selector call failed — keeping current selection")
+            return
+
+    result = response.json()
+    selection: dict[str, str] = result.get("selection") or {}
+    swapped: bool = bool(result.get("selector_swapped", False))
+
+    # Overwrite the 4 agent keys unconditionally
+    updated = dict(current_model_selection)
+    for key in AGENT_KEYS:
+        if key in selection:
+            updated[key] = selection[key]
+
+    # Only overwrite model_selector if swapped
+    if swapped:
+        updated["model_selector"] = result.get("selector_model_used", configured_selector)
+
+    current_model_selection = updated
+    _save_model_selection(updated)
+    logger.info(
+        "Model selection updated: %s (selector_swapped=%s)",
+        {k: updated.get(k) for k in AGENT_KEYS},
+        swapped,
+    )
+
+
 async def _run_automatic_workflow() -> None:
     """Runs all workflow steps sequentially without waiting for manual approval.
 
@@ -1009,10 +1149,30 @@ async def _run_automatic_workflow() -> None:
     another request, which surfaces here as status flipping to "failed" the
     moment that run_next() call returns — the loop condition below then exits
     without kicking off another step.
+
+    Model selection (when enabled) runs **after** the Jira step, so the
+    ticket context has already been populated and can be fed to the
+    selector agent.
     """
     manual_workflow.current_action = "Automatic workflow running..."
     manual_workflow.status = "running"
     await manual_workflow.broadcast()
+
+    # Run the Jira step first so the ticket is available for model selection
+    if manual_workflow.step_index == 0:
+        await manual_workflow.run_next()
+        if manual_workflow.status == "failed":
+            await manual_workflow.broadcast()
+            return
+        manual_workflow.status = "running"
+
+    # Model selection right after Jira (ticket context is now populated)
+    if auto_model_selection:
+        manual_workflow.current_action = "Running model selection..."
+        await manual_workflow.broadcast()
+        await _run_model_selection()
+
+    # Run remaining steps
     while manual_workflow.status not in {"failed", "completed"} and manual_workflow.step_index < len(manual_workflow.steps):
         await manual_workflow.run_next()
         if manual_workflow.status == "waiting":
@@ -1192,3 +1352,38 @@ async def workflow_set_model_selection(payload: dict[str, Any] = Body(...)) -> d
     current_model_selection = updated
     _save_model_selection(updated)
     return dict(current_model_selection)
+
+
+# -- Auto model selection endpoints -----------------------------------------
+
+
+@app.get("/api/workflow/auto-model-selection")
+async def workflow_get_auto_model_selection() -> dict[str, bool]:
+    """Return whether LLM-based model selection runs before each workflow."""
+    return {"enabled": auto_model_selection}
+
+
+@app.post("/api/workflow/set-auto-model-selection")
+async def workflow_set_auto_model_selection(
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    """Enable or disable automatic LLM-based model selection.
+
+    When enabled, the orchestrator calls the Model Selector agent before
+    each automatic workflow run and overwrites the per-agent model choices
+    with its recommendations.
+    """
+    global auto_model_selection
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(
+            status_code=400,
+            detail="'enabled' must be a boolean",
+        )
+    auto_model_selection = enabled
+    return {
+        "command": "set-auto-model-selection",
+        "accepted": True,
+        "enabled": auto_model_selection,
+        "timestamp": manual_workflow._now(),
+    }

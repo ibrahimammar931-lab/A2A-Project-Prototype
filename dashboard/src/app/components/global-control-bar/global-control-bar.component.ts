@@ -1,4 +1,4 @@
-import { Component, computed, inject } from '@angular/core';
+import { Component, computed, inject, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MatButtonModule } from '@angular/material/button';
 import { MatButtonToggleModule } from '@angular/material/button-toggle';
@@ -64,6 +64,17 @@ import { WorkflowStatus } from '../../models/workflow.models';
             Automatic
           </mat-button-toggle>
         </mat-button-toggle-group>
+
+        <mat-slide-toggle
+          [ngModel]="workflow.autoModelSelection()"
+          (ngModelChange)="onAutoModelToggle($event)"
+          color="accent"
+          matTooltip="Let the LLM-based Model Selector choose which model each agent uses (Auto) or pick them yourself (Manual)">
+          <span class="auto-model-label">
+            <mat-icon>psychology</mat-icon>
+            {{ workflow.autoModelSelection() ? 'Auto Models' : 'Manual Models' }}
+          </span>
+        </mat-slide-toggle>
 
         <mat-slide-toggle [(ngModel)]="workflowOpenPr" color="primary" matTooltip="Open a pull request after applying changes">
           Open PR
@@ -165,6 +176,18 @@ import { WorkflowStatus } from '../../models/workflow.models';
       margin-right: 6px;
     }
 
+    .auto-model-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .auto-model-label mat-icon {
+      font-size: 18px;
+      width: 18px;
+      height: 18px;
+    }
+
     @media (max-width: 720px) {
       .control-bar {
         padding: 12px;
@@ -180,7 +203,7 @@ import { WorkflowStatus } from '../../models/workflow.models';
     }
   `]
 })
-export class GlobalControlBarComponent {
+export class GlobalControlBarComponent implements OnInit {
   readonly workflow = inject(WorkflowStateService);
   readonly summary = this.workflow.summary;
   readonly statusClass = computed(() => `state-${this.summary().status}`);
@@ -194,9 +217,17 @@ export class GlobalControlBarComponent {
     return value.split('-').map((part) => part[0].toUpperCase() + part.slice(1)).join(' ');
   }
 
+  ngOnInit(): void {
+    this.workflow.fetchAutoModelSelection();
+  }
+
   onModeToggle(event: any): void {
     const newMode = event.value;
     this.workflow.setMode(newMode);
+  }
+
+  onAutoModelToggle(enabled: boolean): void {
+    this.workflow.setAutoModelSelection(enabled);
   }
 
   startWorkflow(): void {
