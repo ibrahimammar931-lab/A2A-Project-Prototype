@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import litellm
 from fastapi import FastAPI, HTTPException
@@ -62,15 +62,23 @@ def _run_git(repo_path: Path, args: list[str]) -> str:
 
 
 def _get_head_sha(repo_path: Path, branch: str) -> str | None:
-    """Return the commit SHA for the tip of *branch*, or None if unresolvable."""
+    """Return the commit SHA for the tip of *branch*, or None if unresolvable.
+
+    DESIGN CHOICE: the remote-tracking ref (``refs/remotes/origin/<branch>``)
+    is checked *first*, ahead of the local ref. Changes land on GitHub via
+    the Contents API (see ``_read_file_at_commit`` below) rather than local
+    commits, so after a ``git fetch`` the remote-tracking ref is what
+    actually reflects the branch's true current tip — a stale local ref
+    left over from an earlier checkout would otherwise report an outdated
+    SHA and make already-synced branches look up to date when they are not.
+    """
     try:
-        # Try local ref first, then remote tracking ref
-        sha = _run_git(repo_path, ["rev-parse", f"refs/heads/{branch}"])
+        sha = _run_git(repo_path, ["rev-parse", f"refs/remotes/origin/{branch}"])
         return sha
     except RuntimeError:
         pass
     try:
-        sha = _run_git(repo_path, ["rev-parse", f"refs/remotes/origin/{branch}"])
+        sha = _run_git(repo_path, ["rev-parse", f"refs/heads/{branch}"])
         return sha
     except RuntimeError:
         return None
@@ -166,6 +174,96 @@ class KnowledgeAgent:
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # -- Drift refresh (shared) ---------------------------------------------
+
+    def _refresh_if_drifted(self, repository_path: str, branch: str) -> Tuple[Dict[str, Any], bool]:
+        """Bring a branch's knowledge up to date with its current HEAD, if needed.
+
+        Compares the branch's stored ``source_sha`` against its actual
+        current HEAD (resolved via ``_get_head_sha``, which prefers the
+        remote-tracking ref). If they match, nothing happens. If they
+        differ, this diffs ``stored_sha..current_sha`` and patches in only
+        the changed files via ``update_knowledge`` — the same targeted,
+        LLM-only-where-needed approach ``sync_all_branches`` has always
+        used, now factored out so ``ensure_knowledge`` and
+        ``_copy_branch_knowledge`` can call it too instead of only ever
+        refreshing during an explicit ``/sync-branches`` run.
+
+        Returns ``(metadata, drifted)`` where ``drifted`` is True if the
+        branch's knowledge content actually changed (rebuilt or patched),
+        and False if it was already current, could not be resolved, or the
+        SHA moved without any file-level changes (e.g. an empty merge).
+        """
+        repo = Path(repository_path).resolve()
+        metadata = self._read_metadata(repository_path, branch)
+        stored_sha = metadata.get("source_sha")
+        current_sha = _get_head_sha(repo, branch)
+
+        if current_sha is None:
+            logger.warning("Cannot resolve HEAD for branch %s — skipping drift refresh", branch)
+            return metadata, False
+
+        if stored_sha == current_sha:
+            return metadata, False
+
+        logger.info(
+            "Branch %s drifted from %s to %s — refreshing knowledge",
+            branch,
+            stored_sha or "unknown",
+            current_sha,
+        )
+
+        if not stored_sha:
+            # No baseline to diff against — rebuild fully.
+            return self.build_knowledge(repository_path, branch), True
+
+        try:
+            changed_files_raw = _run_git(repo, ["diff", "--name-only", stored_sha, current_sha])
+        except RuntimeError:
+            # Old SHA isn't reachable (e.g. force-push) — rebuild from scratch.
+            logger.warning(
+                "Cannot diff %s..%s for branch %s — rebuilding from scratch",
+                stored_sha,
+                current_sha,
+                branch,
+            )
+            return self.build_knowledge(repository_path, branch), True
+
+        changed_paths = [p.strip() for p in changed_files_raw.splitlines() if p.strip()]
+
+        if not changed_paths:
+            # SHA moved but nothing file-level changed (e.g. an empty merge
+            # commit) — just bump source_sha, no content to refresh.
+            metadata["source_sha"] = current_sha
+            metadata["generated_at"] = datetime.utcnow().isoformat() + "Z"
+            self._write_metadata(repository_path, branch, metadata)
+            return metadata, False
+
+        # BUG FIX: this used to decide update-vs-delete by checking
+        # `(repo / path).exists()` against the local working tree. That is
+        # the wrong source of truth — per the design note on
+        # `_read_file_at_commit`, changes land via the GitHub Contents API,
+        # not local commits, so the working tree is very often checked out
+        # to an entirely different branch or a stale commit. A file that
+        # genuinely exists on `branch` at `current_sha` but happens to be
+        # absent from whatever is currently checked out locally would get
+        # misclassified as "delete" here, wiping out its knowledge entry
+        # even though the file is present and unchanged content-wise —
+        # producing near-empty knowledge for a branch that actually has
+        # plenty of files. `update_knowledge` already resolves this
+        # correctly and safely: for action="update" with content=None it
+        # reads via `_read_file_at_commit` (git's object store at the real
+        # commit, bypassing the working tree) and treats a genuine "not
+        # present at that commit" result as a delete on its own. So every
+        # changed path is passed through as "update" and update_knowledge
+        # makes the real update-vs-delete call using git, not the disk.
+        changes: List[FileChange] = [
+            FileChange(path=path, action="update", content=None) for path in changed_paths
+        ]
+
+        result = self.update_knowledge(repository_path, branch, changes)
+        return result["metadata"], True
+
     # -- Public API (branch-scoped) ----------------------------------------
 
     def ensure_knowledge(
@@ -184,7 +282,22 @@ class KnowledgeAgent:
         cheaper and correct. Whatever the branch's own work changes later
         gets patched in by the normal ``update_knowledge`` call at the end
         of the workflow (e.g. Repo-final applying the Developer's changes).
+
+        Before doing anything else this fetches remote state, so SHA
+        comparisons below (both for the parent and for an existing branch)
+        reflect the real current tip on GitHub rather than a possibly stale
+        local view. It then proactively refreshes for drift: a known parent
+        is refreshed before being copied from, and an already-existing
+        branch is refreshed before its knowledge is loaded and returned —
+        so callers always get knowledge that matches the branch's actual
+        current HEAD, not whatever it happened to be when it was last built.
         """
+        repo = Path(repository_path).resolve()
+        try:
+            _run_git(repo, ["fetch", "--all", "--prune"])
+        except RuntimeError as exc:
+            logger.warning("Fetch failed during ensure_knowledge for %s: %s", branch, exc)
+
         knowledge_dir = self._knowledge_dir(repository_path, branch)
         if not knowledge_dir.exists():
             if known_parent:
@@ -195,6 +308,10 @@ class KnowledgeAgent:
                         branch,
                         known_parent,
                     )
+                    # Refresh the parent first so we copy a baseline that
+                    # reflects its true current state, not a stale one that
+                    # predates commits which have since landed on GitHub.
+                    self._refresh_if_drifted(repository_path, known_parent)
                     self._copy_branch_knowledge(repository_path, known_parent, branch)
                     return self.load_knowledge(repository_path, branch)
                 logger.info(
@@ -223,6 +340,9 @@ class KnowledgeAgent:
             return self.load_knowledge(repository_path, branch)
 
         logger.info("Loading existing knowledge for %s (branch %s)", repository_path, branch)
+        # The branch may have moved on GitHub since knowledge was last built
+        # or updated — refresh any drift before handing knowledge back.
+        self._refresh_if_drifted(repository_path, branch)
         return self.load_knowledge(repository_path, branch)
 
     def build_knowledge(self, repository_path: str, branch: str, model: str | None = None) -> Dict[str, Any]:
@@ -314,6 +434,18 @@ class KnowledgeAgent:
         new branch, rather than reusing the source's SHA, keeps this correct
         even if called slightly after creation, e.g. if a commit or two has
         already landed on the new branch before this runs).
+
+        IMPORTANT: relabeling metadata's ``source_sha`` to ``new_branch``'s
+        current HEAD is not, by itself, enough to make that true — the files
+        that were actually copied only reflect content as of the *source*
+        branch's own ``source_sha`` at copy time. If ``new_branch`` already
+        has commits beyond that baseline (the case described above), simply
+        overwriting the label would mask the drift: the metadata would claim
+        to be current as of ``new_branch``'s HEAD while the file contents
+        still describe the older, copied baseline. So after relabeling, this
+        diffs the copied baseline against ``new_branch``'s actual HEAD and,
+        if they differ, patches in the difference via ``update_knowledge``
+        so the copy is genuinely accurate rather than just labeled as such.
         """
         source_dir = self._knowledge_dir(repository_path, source_branch)
         if not source_dir.exists():
@@ -332,11 +464,54 @@ class KnowledgeAgent:
         new_branch_sha = _get_head_sha(repo, new_branch)
 
         metadata = self._read_metadata(repository_path, new_branch)
+        # The SHA the copied files actually reflect, before we relabel it.
+        copied_baseline_sha = metadata.get("source_sha")
         metadata["branch"] = new_branch
         metadata["generated_at"] = datetime.utcnow().isoformat() + "Z"
         if new_branch_sha:
             metadata["source_sha"] = new_branch_sha
         self._write_metadata(repository_path, new_branch, metadata)
+
+        if (
+            new_branch_sha
+            and copied_baseline_sha
+            and copied_baseline_sha != new_branch_sha
+        ):
+            logger.info(
+                "Copied baseline for %s (%s) differs from its actual HEAD (%s) — refreshing to catch up",
+                new_branch,
+                copied_baseline_sha,
+                new_branch_sha,
+            )
+            try:
+                changed_files_raw = _run_git(repo, ["diff", "--name-only", copied_baseline_sha, new_branch_sha])
+                changed_paths = [p.strip() for p in changed_files_raw.splitlines() if p.strip()]
+                if changed_paths:
+                    # Same fix as _refresh_if_drifted: don't classify
+                    # update-vs-delete from `(repo / path).exists()` — the
+                    # working tree may not be checked out to `new_branch` at
+                    # all, so that check tells us nothing reliable about
+                    # what actually exists on this branch. Pass every path
+                    # through as "update" with content=None and let
+                    # update_knowledge resolve real existence via
+                    # `_read_file_at_commit` against `new_branch_sha`
+                    # itself. Doing it the old way was silently deleting
+                    # knowledge for files that genuinely exist on the new
+                    # branch, which is exactly why newly-created branches
+                    # were ending up with next to nothing in `files/`.
+                    changes: List[FileChange] = [
+                        FileChange(path=path, action="update", content=None) for path in changed_paths
+                    ]
+                    update_result = self.update_knowledge(repository_path, new_branch, changes)
+                    metadata = update_result["metadata"]
+            except RuntimeError as exc:
+                logger.warning(
+                    "Could not diff %s..%s to refresh copied knowledge for %s (%s) — leaving as copied",
+                    copied_baseline_sha,
+                    new_branch_sha,
+                    new_branch,
+                    exc,
+                )
 
         logger.info(
             "Copied knowledge for branch '%s' from '%s' (%d files, SHA %s)",
@@ -500,6 +675,11 @@ class KnowledgeAgent:
         path used during normal workflow runs), so it can only guess the
         configured default base branch.
 
+        Branches that already have knowledge are brought up to date via the
+        same ``_refresh_if_drifted`` helper ``ensure_knowledge`` uses, so
+        both paths detect and patch drift identically instead of keeping
+        separate copies of the diff-and-patch logic.
+
         Returns a summary like::
 
             {
@@ -574,6 +754,11 @@ class KnowledgeAgent:
                         branch,
                         default_base,
                     )
+                    # Refresh the base first so new branches are copied from
+                    # an up-to-date baseline, then let _copy_branch_knowledge's
+                    # own catch-up refresh handle any commits already on
+                    # `branch` beyond that baseline.
+                    self._refresh_if_drifted(repository_path, default_base)
                     self._copy_branch_knowledge(repository_path, default_base, branch)
                 else:
                     logger.info(
@@ -584,65 +769,13 @@ class KnowledgeAgent:
                 created.append(branch)
                 continue
 
-            # Branch exists and has knowledge — check if it's drifted
-            metadata = self._read_metadata(repository_path, branch)
-            stored_sha = metadata.get("source_sha")
-            current_sha = _get_head_sha(repo, branch)
-
-            if current_sha is None:
-                # Can't resolve HEAD for this branch; skip update
-                logger.warning("Sync: cannot resolve HEAD for branch %s — skipping", branch)
-                unchanged.append(branch)
-                continue
-
-            if stored_sha == current_sha:
-                # No change
-                unchanged.append(branch)
-                continue
-
-            # Branch has moved — compute diff and update
-            logger.info(
-                "Sync: branch %s moved from %s to %s — updating knowledge",
-                branch,
-                stored_sha or "unknown",
-                current_sha,
-            )
-            try:
-                changed_files_raw = _run_git(repo, ["diff", "--name-only", stored_sha or current_sha, current_sha])
-            except RuntimeError:
-                # If the old SHA isn't reachable (e.g. force-push), rebuild
-                logger.warning(
-                    "Sync: cannot diff %s..%s for branch %s — rebuilding from scratch",
-                    stored_sha,
-                    current_sha,
-                    branch,
-                )
-                self.build_knowledge(repository_path, branch)
+            # Branch exists and has knowledge — refresh it if it has drifted,
+            # using the same shared logic ensure_knowledge relies on.
+            _metadata, drifted = self._refresh_if_drifted(repository_path, branch)
+            if drifted:
                 updated.append(branch)
-                continue
-
-            changed_paths = [p.strip() for p in changed_files_raw.splitlines() if p.strip()]
-
-            if not changed_paths:
-                # SHA changed but diff is empty (e.g. merge commit with no
-                # file-level changes) — just bump the source_sha
-                metadata["source_sha"] = current_sha
-                metadata["generated_at"] = datetime.utcnow().isoformat() + "Z"
-                self._write_metadata(repository_path, branch, metadata)
+            else:
                 unchanged.append(branch)
-                continue
-
-            # Build FileChange list
-            changes: List[FileChange] = []
-            for path in changed_paths:
-                file_on_disk = repo / path
-                if file_on_disk.exists():
-                    changes.append(FileChange(path=path, action="update", content=None))
-                else:
-                    changes.append(FileChange(path=path, action="delete", content=None))
-
-            self.update_knowledge(repository_path, branch, changes)
-            updated.append(branch)
 
         # c. Delete knowledge for branches that no longer exist
         for branch in sorted(existing_knowledge_branches):

@@ -477,7 +477,7 @@ class ManualWorkflowController:
     async def _run_planner(self) -> None:
         ticket: JiraTicket = self.context["ticket"]
         knowledge: dict[str, Any] = self.context["knowledge"]
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             response = await post_or_raise(
                 client,
                 f"{PLANNER_SERVICE_URL}/plan",
@@ -499,7 +499,7 @@ class ManualWorkflowController:
         planned_existing_files = list(dict.fromkeys(planning_result.likely_existing_files))
         planned_new_files = list(dict.fromkeys(planning_result.new_files))
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             repo_files = []
             if planned_existing_files:
                 files_response = await post_or_raise(
@@ -559,7 +559,7 @@ class ManualWorkflowController:
             message_type="code_review_request",
             payload=review_payload,
         )
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             reviewer_response = await post_or_raise(
                 client,
                 f"{REVIEWER_SERVICE_URL}/review",
@@ -630,7 +630,7 @@ class ManualWorkflowController:
             },
         )
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             improvement_response = await post_or_raise(
                 client,
                 f"{DEVELOPER_SERVICE_URL}/improve",

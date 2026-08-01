@@ -48,14 +48,6 @@ AVAILABLE_MODELS: list[AvailableModel] = [
         "power": 5,
     },
     {
-        "id": "groq/openai/gpt-oss-20b",
-        "label": "GPT-OSS 20B (Groq, balanced)",
-        "provider": "groq",
-        "requires_env": "GROQ_API_KEY",
-        "capabilities": "general-purpose, balanced performance, code generation",
-        "power": 2,
-    },
-    {
         "id": "gemini/gemini-2.5-flash",
         "label": "Gemini 2.5 Flash (Google, strong reasoning/coding)",
         "provider": "gemini",
@@ -69,6 +61,6 @@ AVAILABLE_MODELS: list[AvailableModel] = [
         "provider": "deepseek",
         "requires_env": "DEEPSEEK_API_KEY",
         "capabilities": "fast inference, code generation, instruction-following",
-        "power": 2,
+        "power": 4,
     },
 ]
