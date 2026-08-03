@@ -1037,10 +1037,12 @@ async def _check_model_health(model_id: str) -> bool:
 async def _run_model_selection() -> None:
     """Call the Model Selector agent and persist its returned assignments.
 
-    Only overwrites the 4 agent keys (knowledge, planner, developer,
-    reviewer).  The ``model_selector`` key is overwritten only when the
-    selector agent reports that it was forced to swap to a different model
-    (i.e. ``selector_swapped`` is true).
+    Only ever overwrites the 4 agent keys (knowledge, planner, developer,
+    reviewer). ``model_selector`` is a fixed, human-controlled setting —
+    this function's job is choosing models *for* the 4 agents, never for
+    itself. The Model Selector service now fails loudly (503) instead of
+    silently swapping when its configured model is unhealthy, so there is
+    no "swapped" case to handle or persist here anymore.
 
     Every candidate model is health-checked **before** the list is sent to
     the selector — only models that respond to a trivial ping are included.
@@ -1091,20 +1093,14 @@ async def _run_model_selection() -> None:
             ", ".join(unhealthy),
         )
 
-    # ---- Ensure a model_selector model is configured -------------------
-    configured_selector = current_model_selection.get("model_selector")
-    if not configured_selector or configured_selector not in {c["id"] for c in healthy_candidates}:
-        configured_selector = healthy_candidates[0]["id"]
-        current_model_selection["model_selector"] = configured_selector
-        _save_model_selection(current_model_selection)
-
     ticket: JiraTicket | None = manual_workflow.context.get("ticket")
     ticket_text = ticket_to_task(ticket) if ticket else ""
 
+    # The model_selector agent reads its own model from model_selection.json
+    # itself — we don't pass a current_selection payload for it here.
     payload = {
         "ticket": ticket_text,
         "candidates": healthy_candidates,
-        "current_selection": dict(current_model_selection),
     }
 
     async with httpx.AsyncClient(timeout=90) as client:
@@ -1114,30 +1110,28 @@ async def _run_model_selection() -> None:
                 json=payload,
             )
             response.raise_for_status()
-        except Exception as exc:
+        except Exception:
             logger.exception("Model selector call failed — keeping current selection")
             return
 
     result = response.json()
     selection: dict[str, str] = result.get("selection") or {}
-    swapped: bool = bool(result.get("selector_swapped", False))
 
-    # Overwrite the 4 agent keys unconditionally
+    # Only the 4 role keys are ever written here. model_selector is a fixed,
+    # human-controlled setting (see model_selection.json /
+    # workflow_set_model_selection) — this function never touches it,
+    # regardless of what the selector service reports about itself.
     updated = dict(current_model_selection)
     for key in AGENT_KEYS:
         if key in selection:
             updated[key] = selection[key]
 
-    # Only overwrite model_selector if swapped
-    if swapped:
-        updated["model_selector"] = result.get("selector_model_used", configured_selector)
-
     current_model_selection = updated
     _save_model_selection(updated)
     logger.info(
-        "Model selection updated: %s (selector_swapped=%s)",
+        "Model selection updated: %s (selector_model_used=%s)",
         {k: updated.get(k) for k in AGENT_KEYS},
-        swapped,
+        result.get("selector_model_used"),
     )
 
 

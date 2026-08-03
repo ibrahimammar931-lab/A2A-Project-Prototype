@@ -1,25 +1,21 @@
 """
-Model Selector Agent — LLM-based ticket classification + deterministic
-per-role model assignment, with inline health checks and selector fallback.
+Model Selector Agent — Single LLM call for end-to-end model selection per role.
 
-Assignment design (the part that changed):
+Architecture:
+  1. Health-check all candidates + the configured selector model via a simple
+     ping (same as before — try/except litellm.completion, no ledger/cache).
+  2. Pass the ticket text + the list of healthy candidates (with their
+     capabilities, power, and label) to a single LLM call.
+  3. The LLM assesses the ticket's complexity, determines which capabilities
+     each role needs (knowledge, planner, developer, reviewer), and selects
+     the best model from the healthy candidates for each role.
+  4. Return the selection, complexity, required capabilities, and metadata.
 
-  Stage 1 (LLM):   read the ticket, return ONLY a complexity classification
-                   and any unusual required capabilities. Never returns a
-                   model ID.
-  Stage 2 (code):  compute each role's target "power" from complexity +
-                   a per-role weight, filter candidates by required
-                   capability, and pick the closest-power match per role.
-
-Role priority (developer >= planner/reviewer >= knowledge) is guaranteed
-by construction via _ROLE_POWER_WEIGHT scaling the same percentile used
-for complexity — not by a separate post-hoc cap+rerank pass. See
-_target_power_for_role for why this holds at every complexity level.
-
-Health checking is unchanged from the original design: no ledger, no
-caching, no TTL, no cooldown windows — a direct try/except ping when a
-health check is needed. (Out of scope for this revision; the assignment
-logic above is what was reworked.)
+The LLM is the sole decision-maker for the 4 role assignments — there are no
+deterministic post-processing functions that override or re-rank its choices
+for knowledge/planner/developer/reviewer. The model_selector itself (the LLM
+that makes this call) is a separately configured, fixed setting — it is never
+swapped automatically; see _resolve_selector_model.
 """
 from __future__ import annotations
 
@@ -37,7 +33,7 @@ from config import configure_logging
 configure_logging()
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Model Selector Agent Service", version="2.0.0")
+app = FastAPI(title="Model Selector Agent Service", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:4200", "http://localhost:4200"],
@@ -71,26 +67,55 @@ def check_model_health(model_id: str) -> bool:
         return False
 
 
-# -- Roles --------------------------------------------------------------
+# -- Roles -------------------------------------------------------------------
 
-_FALLBACK_ORDER = ["knowledge", "planner", "developer", "reviewer"]
+_ROLES = ["knowledge", "planner", "developer", "reviewer"]
 
-# -- Complexity rubric ---------------------------------------------------
+_ROLE_DESCRIPTIONS = """
+## Role Capability Profiles
 
-_COMPLEXITY_LEVELS = ["trivial", "simple", "moderate", "complex", "very_complex"]
+Each role in the workflow has different demands — the model assigned to it
+must match those demands.
 
-# How far up the available power range each complexity level is allowed to
-# reach, as a fraction between the lowest and highest candidate power score.
-_COMPLEXITY_MAX_PERCENTILE = {
-    "trivial": 0.0,
-    "simple": 0.25,
-    "moderate": 0.55,
-    "complex": 0.85,
-    "very_complex": 1.0,
-}
+### knowledge
+- Extracts project context, conventions, and existing patterns from the
+  codebase.
+- Needs: strong retrieval/understanding over potentially large code surfaces,
+  reliable instruction-following, code comprehension.
+- Prioritise: breadth of understanding over raw creative power. A fast,
+  cost-effective model with solid code-reading ability is ideal.
+
+### planner
+- Reads the ticket + knowledge report and produces a structured implementation
+  plan with file paths, change descriptions, and ordering.
+- Needs: structured output, reasoning, code architecture understanding,
+  ability to break down ambiguous requirements into concrete steps.
+- Prioritise: strong reasoning and planning ability. Should be able to
+  handle moderate-to-complex architectural decisions.
+
+### developer
+- Implements the actual code changes according to the plan. This is the
+  most execution-heavy role and the one most likely to need the strongest
+  model.
+- Needs: advanced code generation, strong reasoning, instruction-following,
+  ability to work with diffs and multi-file changes. May need long-context
+  if many files are involved.
+- Prioritise: raw coding strength above all else. This role gets the most
+  capable model available.
+
+### reviewer
+- Reviews the developer's diff for correctness, bugs, security issues,
+  style violations, and missed requirements.
+- Needs: strong reasoning, code review capabilities, ability to spot subtle
+  bugs and security issues.
+- Prioritise: analytical depth and attention to detail. Should be comparable
+  to the planner in strength.
+"""
+
+# -- Complexity rubric -------------------------------------------------------
 
 _COMPLEXITY_RUBRIC = """\
-## Complexity rubric
+## Complexity Rubric
 
 Classify the ticket into exactly one of these levels:
 
@@ -118,90 +143,10 @@ Classify the ticket into exactly one of these levels:
   scaling under strict consistency guarantees".
 """
 
-# -- Per-role power weighting -------------------------------------------
-#
-# Encodes "Developer needs the strongest model; Planner and Reviewer need
-# comparable, strong-but-below-Developer reasoning; Knowledge needs the
-# least" as numbers that participate directly in the power-target formula,
-# rather than as a prompt instruction the LLM has to remember and honor
-# across all four roles simultaneously.
-_ROLE_POWER_WEIGHT = {
-    "developer": 1.0,
-    "planner": 0.8,
-    "reviewer": 0.8,
-    "knowledge": 0.5,
-}
+_COMPLEXITY_LEVELS = ["trivial", "simple", "moderate", "complex", "very_complex"]
 
 
-def _target_power_for_role(role: str, complexity: str, min_power: float, max_power: float) -> float:
-    """Deterministic target power for one role, given ticket complexity.
-
-    Both the complexity percentile and the role weight scale the same
-    [min_power, max_power] range, so:
-        power(developer) >= power(planner)
-        power(developer) >= power(reviewer)
-        power(planner)   >= power(knowledge)
-        power(reviewer)  >= power(knowledge)
-    holds by construction at every complexity level — there's nothing to
-    fix after the fact because it can't come out wrong in the first place.
-    """
-    percentile = _COMPLEXITY_MAX_PERCENTILE[complexity]
-    weight = _ROLE_POWER_WEIGHT[role]
-    return min_power + weight * percentile * (max_power - min_power)
-
-
-def _select_model_for_role(target_power: float, candidates: list[dict]) -> dict:
-    """Pick the cheapest candidate that meets or exceeds target_power.
-
-    This is a floor, not a nearest-match: target_power is "at least this
-    capable," not "closest guess in either direction." A model just
-    below the target isn't an acceptable substitute even if it happens to
-    be numerically closer than the cheapest model that actually clears
-    the bar — e.g. developer's target on a moderate ticket sitting at
-    55% of the range should still land on your cheapest top-tier model
-    rather than a mid-tier one that's merely nearby.
-
-    Falls back to the single strongest candidate available if nothing
-    clears the floor (e.g. every candidate is weaker than the target),
-    so a role never ends up with less than the best you've got.
-    """
-    at_or_above = [c for c in candidates if c["power"] >= target_power]
-    if at_or_above:
-        return min(at_or_above, key=lambda c: c["power"])
-    return max(candidates, key=lambda c: c["power"])
-
-
-def _filter_by_capabilities(
-    candidates: list[dict],
-    required_capabilities: list[str],
-) -> tuple[list[dict], list[str]]:
-    """Keep only candidates whose `capabilities` text mentions every
-    required capability tag. If nothing qualifies, fall back to the full
-    pool (closest-available-anyway) and report what's missing instead of
-    silently ignoring the requirement.
-    """
-    if not required_capabilities:
-        return candidates, []
-
-    matched = [
-        c for c in candidates
-        if all(tag.lower() in c["capabilities"].lower() for tag in required_capabilities)
-    ]
-    if matched:
-        return matched, []
-
-    unmet = [
-        tag for tag in required_capabilities
-        if not any(tag.lower() in c["capabilities"].lower() for c in candidates)
-    ]
-    logger.warning(
-        "No candidate satisfies required capabilities %s — falling back to "
-        "full candidate pool. Unmet: %s",
-        required_capabilities,
-        unmet,
-    )
-    return candidates, unmet
-
+# -- Candidate enrichment ----------------------------------------------------
 
 def _build_candidates_list(candidate_models: list[dict]) -> list[dict]:
     """Merge the supplied candidate list with data from AVAILABLE_MODELS.
@@ -225,26 +170,77 @@ def _build_candidates_list(candidate_models: list[dict]) -> list[dict]:
     return enriched
 
 
-# -- Stage 1: LLM classifies only, never picks a model ID -------------------
+def _format_candidates_for_prompt(candidates: list[dict]) -> str:
+    """Render the healthy candidates list as a human-readable table for the LLM."""
+    lines = ["## Available Models (healthy only)", ""]
+    lines.append("| # | Model ID | Label | Power | Capabilities |")
+    lines.append("|---|----------|-------|-------|--------------|")
+    for i, c in enumerate(candidates, 1):
+        lines.append(
+            f"| {i} | `{c['id']}` | {c['label']} | "
+            f"{c['power']} / 5 | {c['capabilities']} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
 
-def _build_classifier_prompt(ticket_text: str) -> str:
+
+# -- Stage: Single LLM call does everything ----------------------------------
+
+def _build_selector_prompt(ticket_text: str, candidates: list[dict]) -> str:
+    """Build a prompt that asks the LLM to do the full model selection."""
+    candidates_table = _format_candidates_for_prompt(candidates)
+
+    complexity_options = ", ".join(_COMPLEXITY_LEVELS)
     return (
-        "You are a ticket classifier. You do NOT choose any model or agent — "
-        "that happens elsewhere. Your only job is:\n\n"
-        "1. Classify the ticket's complexity using the rubric below. Pick the "
-        "closest matching example; don't invent a harder framing of it.\n"
-        "2. List any model capabilities this ticket concretely requires beyond "
-        "ordinary text/code understanding (e.g. \"image_generation\", \"vision\", "
-        "\"long_context\"). Leave the list empty if nothing unusual is needed — "
-        "most tickets need nothing here.\n\n"
+        "You are a model selection engine for a multi-agent code-generation "
+        "workflow. Your job is to analyse a Jira ticket and select the best "
+        "model from the available pool for each of four specialised agents.\n\n"
+
+        "You must:\n"
+        "1. Classify the ticket's complexity using the rubric below.\n"
+        "2. Identify any special capabilities this ticket requires beyond "
+        'ordinary text/code understanding (e.g. "image_generation", '
+        '"vision", "long_context"). Leave the list empty if nothing '
+        "unusual is needed — most tickets need nothing here.\n"
+        "3. For each of the four roles (knowledge, planner, developer, "
+        "reviewer), pick ONE model ID from the available models table. Your "
+        "choice must respect the role's capability profile AND the ticket's "
+        "complexity — stronger models for harder tickets, cheaper/faster "
+        "models for trivial ones.\n\n"
+
+        f"{_ROLE_DESCRIPTIONS}\n\n"
+
+        f"{candidates_table}\n"
+
+        "## Selection Rules\n\n"
+        "- Developer always gets the strongest model or a model very close to "
+        "the strongest, proportional to ticket complexity.\n"
+        "- Planner and Reviewer get comparable strength, slightly below "
+        "Developer when complexity demands it.\n"
+        "- Knowledge gets the most cost-effective model that still satisfies "
+        "the ticket's needs — it can be weaker than the others.\n"
+        "- For trivial/simple tickets, it is acceptable (and encouraged) to "
+        "use cheaper/faster models for all roles.\n"
+        "- You MUST pick model IDs exactly as they appear in the table above. "
+        "Do not invent model IDs.\n"
+        "- If only one model is available, use it for all roles.\n\n"
+
         f"## Ticket\n\n{ticket_text}\n\n"
+
         f"{_COMPLEXITY_RUBRIC}\n"
+
         "## Output\n\n"
         "Return **only** a single valid JSON object — no markdown fences, no "
         "explanation, no extra keys:\n\n"
         "{\n"
-        '  "complexity": "<one of: trivial, simple, moderate, complex, very_complex>",\n'
-        '  "required_capabilities": ["<tag>", ...]\n'
+        f'  "complexity": "<one of: {complexity_options}>",\n'
+        '  "required_capabilities": ["<tag>", ...],\n'
+        '  "selection": {\n'
+        '    "knowledge": "<model_id from table>",\n'
+        '    "planner": "<model_id from table>",\n'
+        '    "developer": "<model_id from table>",\n'
+        '    "reviewer": "<model_id from table>"\n'
+        '  }\n'
         "}\n"
     )
 
@@ -262,7 +258,7 @@ def _parse_json_response(raw_text: str) -> dict[str, Any]:
         parsed = json.loads(text)
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
-        logger.warning("Classifier LLM returned invalid JSON: %r", raw_text[:300])
+        logger.warning("Selector LLM returned invalid JSON: %r", raw_text[:300])
         return {}
 
 
@@ -271,23 +267,26 @@ def select_models_for_ticket(
     candidates: list[dict],
     selector_model: str,
 ) -> dict[str, Any]:
-    """Classify the ticket, then deterministically assign a model per role.
+    """Single LLM call that classifies the ticket AND selects a model per role.
 
-    `candidates` must already be health-filtered and each entry must have
-    at least {"id", "capabilities", "power"}.
+    ``candidates`` must already be health-filtered and each entry must have
+    at least {"id", "capabilities", "power", "label"}.
+
+    Returns a dict with keys: selection, ticket_complexity,
+    required_capabilities, unmet_capabilities.
     """
-    prompt = _build_classifier_prompt(ticket_text)
+    prompt = _build_selector_prompt(ticket_text, candidates)
     try:
         response = litellm.completion(
             model=selector_model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
+            max_tokens=500,
             temperature=0.0,
             timeout=60,
         )
         raw_text = response.choices[0].message.content or ""
     except Exception as exc:
-        logger.exception("Classifier LLM call failed for model %s", selector_model)
+        logger.exception("Selector LLM call failed for model %s", selector_model)
         raise HTTPException(
             status_code=502,
             detail=f"Model selector LLM call failed: {exc}",
@@ -295,34 +294,97 @@ def select_models_for_ticket(
 
     parsed = _parse_json_response(raw_text)
 
+    # -- Validate complexity --------------------------------------------------
     complexity = parsed.get("complexity")
     if complexity not in _COMPLEXITY_LEVELS:
-        logger.info("Classifier returned invalid complexity %r — defaulting to 'moderate'", complexity)
+        logger.info(
+            "Selector returned invalid complexity %r — defaulting to 'moderate'",
+            complexity,
+        )
         complexity = "moderate"
     else:
-        logger.info("Classifier assigned ticket_complexity=%s", complexity)
+        logger.info("Selector assigned ticket_complexity=%s", complexity)
 
+    # -- Validate required_capabilities ---------------------------------------
     required_capabilities = parsed.get("required_capabilities")
     if not isinstance(required_capabilities, list):
         required_capabilities = []
-    required_capabilities = [c for c in required_capabilities if isinstance(c, str) and c.strip()]
+    required_capabilities = [
+        c for c in required_capabilities if isinstance(c, str) and c.strip()
+    ]
 
-    usable_candidates, unmet_capabilities = _filter_by_capabilities(candidates, required_capabilities)
+    # -- Validate and sanitise selection --------------------------------------
+    selection: dict[str, str] = parsed.get("selection") or {}
+    if not isinstance(selection, dict):
+        selection = {}
 
-    powers = [c["power"] for c in usable_candidates]
-    min_power, max_power = min(powers), max(powers)
+    valid_model_ids = {c["id"] for c in candidates}
 
-    selection: dict[str, str] = {}
-    for role in _FALLBACK_ORDER:
-        target = _target_power_for_role(role, complexity, min_power, max_power)
-        selection[role] = _select_model_for_role(target, usable_candidates)["id"]
+    sanitised_selection: dict[str, str] = {}
+    for role in _ROLES:
+        chosen = selection.get(role, "")
+        if isinstance(chosen, str) and chosen.strip() in valid_model_ids:
+            sanitised_selection[role] = chosen.strip()
+        else:
+            # Fallback: pick the strongest (highest power) candidate for this role
+            fallback = max(candidates, key=lambda c: c["power"])
+            sanitised_selection[role] = fallback["id"]
+            logger.warning(
+                "Selector returned invalid or missing model for role %r "
+                "(got %r) — falling back to %s",
+                role,
+                chosen,
+                fallback["id"],
+            )
+
+    # Determine if any required capabilities are unmet by the selected models
+    unmet_capabilities: list[str] = []
+    if required_capabilities:
+        selected_ids = set(sanitised_selection.values())
+        selected_caps_text = " ".join(
+            c["capabilities"].lower()
+            for c in candidates
+            if c["id"] in selected_ids
+        )
+        for tag in required_capabilities:
+            if tag.lower() not in selected_caps_text:
+                unmet_capabilities.append(tag)
+        if unmet_capabilities:
+            logger.warning(
+                "Required capabilities %s are not covered by selected models",
+                unmet_capabilities,
+            )
 
     return {
-        "selection": selection,
+        "selection": sanitised_selection,
         "ticket_complexity": complexity,
         "required_capabilities": required_capabilities,
         "unmet_capabilities": unmet_capabilities,
     }
+
+
+# -- Model selection config --------------------------------------------------
+
+MODEL_SELECTION_FILE = "model_selection.json"
+
+
+def _load_selector_model_id() -> str:
+    """Read the model_selector key from model_selection.json."""
+    try:
+        raw = json.loads(open(MODEL_SELECTION_FILE, encoding="utf-8").read())
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Cannot read {MODEL_SELECTION_FILE}: {exc}",
+        ) from exc
+
+    model_id = raw.get("model_selector")
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise HTTPException(
+            status_code=502,
+            detail=f"model_selector key is missing or invalid in {MODEL_SELECTION_FILE}",
+        )
+    return model_id.strip()
 
 
 # -- /select-models endpoint ------------------------------------------------
@@ -340,24 +402,12 @@ async def select_models(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             detail="'candidates' must be a non-empty list of model objects",
         )
 
-    current_selection: dict[str, str | None] = payload.get("current_selection") or {}
-    if not isinstance(current_selection, dict):
-        current_selection = {}
-
-    configured_selector_model: str | None = current_selection.get("model_selector")
-    if not configured_selector_model:
-        raise HTTPException(
-            status_code=400,
-            detail="'current_selection.model_selector' is required and must be a non-empty string",
-        )
-
     # Enrich candidates with capabilities/power from static registry
     all_candidates = _build_candidates_list(raw_candidates)
 
-    # ---- Step 0: health-check every candidate ourselves --------------------
-    # Do not trust the caller's pre-filtering. The service that actually
-    # assigns models to roles is the one that must guarantee those models
-    # are healthy.
+    # ---- Step 0: health-check every candidate --------------------------------
+    # Only healthy models are presented to the selector LLM as choices for the
+    # 4 roles.
     candidates = [c for c in all_candidates if check_model_health(c["id"])]
     if not candidates:
         raise HTTPException(
@@ -365,35 +415,43 @@ async def select_models(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
             detail="All candidate models failed health checks — cannot select models",
         )
 
-    # Sort ascending by power so anything downstream that wants a cheap
-    # default gets a stable, sensible choice.
+    # Sort ascending by power for consistent prompt rendering
     candidates.sort(key=lambda c: c["power"])
 
-    # ---- Step 1: health-check the configured selector model ----------------
-    selector_used = configured_selector_model
-    swapped = False
+    # ---- Step 1: resolve the selector model from model_selection.json ---------
+    # This is a fixed, user-configured setting — unlike the 4 role candidates,
+    # it is never swapped automatically. If it's unhealthy, that's a config/
+    # ops problem to surface and fix, not something this endpoint should paper
+    # over by silently routing the selection call through a different model
+    # than the one configured.
+    selector_model = _load_selector_model_id()
 
-    if check_model_health(configured_selector_model):
-        logger.info(
-            "Configured model_selector %s is healthy — using it for classification",
-            configured_selector_model,
+    if not check_model_health(selector_model):
+        logger.error(
+            "Configured model_selector %s (from %s) is unhealthy — refusing to "
+            "auto-swap it. Fix the model's credentials/availability or update "
+            "%s.",
+            selector_model,
+            MODEL_SELECTION_FILE,
+            MODEL_SELECTION_FILE,
         )
-    else:
-        logger.warning(
-            "Configured model_selector %s is unhealthy — falling back to candidates",
-            configured_selector_model,
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Configured model_selector '{selector_model}' failed its "
+                "health check. It is not auto-swapped — update "
+                f"{MODEL_SELECTION_FILE} or restore the model's availability."
+            ),
         )
-        selector_used = candidates[0]["id"]
-        swapped = True
-        logger.info("Using %s as fallback selector model", selector_used)
 
-    # ---- Step 2: classify + deterministically assign -----------------------
-    result = select_models_for_ticket(ticket_text, candidates, selector_used)
+    logger.info("model_selector %s (from %s) is healthy", selector_model, MODEL_SELECTION_FILE)
+
+    # ---- Step 2: single LLM call does everything for the 4 roles -------------
+    result = select_models_for_ticket(ticket_text, candidates, selector_model)
 
     return {
         "selection": result["selection"],
-        "selector_model_used": selector_used,
-        "selector_swapped": swapped,
+        "selector_model_used": selector_model,
         "ticket_complexity": result["ticket_complexity"],
         "required_capabilities": result["required_capabilities"],
         "unmet_capabilities": result["unmet_capabilities"],
