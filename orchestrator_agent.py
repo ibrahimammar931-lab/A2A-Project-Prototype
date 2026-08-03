@@ -914,9 +914,11 @@ def _load_model_selection() -> dict[str, str | None]:
     """Load persisted model selection from MODEL_SELECTION_FILE.
 
     Returns a dict mapping each agent key to a LiteLLM model id, or None
-    if no override has been saved yet. Missing keys are filled with None
-    from _model_selection_defaults.
+    if no override has been saved yet or the saved model is no longer in
+    AVAILABLE_MODELS. Missing keys are filled with None from
+    _model_selection_defaults.
     """
+    available_ids = {entry["id"] for entry in AVAILABLE_MODELS}
     try:
         raw = json.loads(open(MODEL_SELECTION_FILE, encoding="utf-8").read())
     except (FileNotFoundError, json.JSONDecodeError):
@@ -926,7 +928,16 @@ def _load_model_selection() -> dict[str, str | None]:
     for key in ALL_MODEL_SELECTION_KEYS:
         val = raw.get(key)
         if isinstance(val, str) and val.strip():
-            result[key] = val.strip()
+            model_id = val.strip()
+            if model_id in available_ids:
+                result[key] = model_id
+            else:
+                logger.warning(
+                    "Ignoring saved model selection for %s: %s is not in AVAILABLE_MODELS",
+                    key,
+                    model_id,
+                )
+                result[key] = None
         else:
             result[key] = None
     return result
@@ -935,9 +946,11 @@ def _load_model_selection() -> dict[str, str | None]:
 def _save_model_selection(selection: dict[str, str | None]) -> None:
     """Write the current model selection dict to MODEL_SELECTION_FILE.
     Only persists keys in ALL_MODEL_SELECTION_KEYS."""
+    available_ids = {entry["id"] for entry in AVAILABLE_MODELS}
     out: dict[str, str | None] = {}
     for key in ALL_MODEL_SELECTION_KEYS:
-        out[key] = selection.get(key)
+        value = selection.get(key)
+        out[key] = value if value in available_ids else None
     with open(MODEL_SELECTION_FILE, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
 
@@ -1121,7 +1134,10 @@ async def _run_model_selection() -> None:
     # human-controlled setting (see model_selection.json /
     # workflow_set_model_selection) — this function never touches it,
     # regardless of what the selector service reports about itself.
-    updated = dict(current_model_selection)
+    # Reload from disk before applying the partial update. This prevents a
+    # long-running server from writing an old in-memory model_selector value
+    # back over a manual edit to model_selection.json.
+    updated = _load_model_selection()
     for key in AGENT_KEYS:
         if key in selection:
             updated[key] = selection[key]
@@ -1320,7 +1336,7 @@ async def workflow_set_model_selection(payload: dict[str, Any] = Body(...)) -> d
     credentialed = _credentialed_model_ids()
 
     updated = dict(current_model_selection)
-    for key in AGENT_KEYS:
+    for key in ALL_MODEL_SELECTION_KEYS:
         if key not in payload:
             continue
         value = payload[key]

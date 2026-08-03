@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 import litellm
@@ -213,17 +214,35 @@ def _build_selector_prompt(ticket_text: str, candidates: list[dict]) -> str:
         f"{candidates_table}\n"
 
         "## Selection Rules\n\n"
-        "- Developer always gets the strongest model or a model very close to "
-        "the strongest, proportional to ticket complexity.\n"
-        "- Planner and Reviewer get comparable strength, slightly below "
-        "Developer when complexity demands it.\n"
-        "- Knowledge gets the most cost-effective model that still satisfies "
-        "the ticket's needs — it can be weaker than the others.\n"
-        "- For trivial/simple tickets, it is acceptable (and encouraged) to "
-        "use cheaper/faster models for all roles.\n"
-        "- You MUST pick model IDs exactly as they appear in the table above. "
-        "Do not invent model IDs.\n"
-        "- If only one model is available, use it for all roles.\n\n"
+        "## Selection Rules\n\n"
+        "- Match model strength to ticket complexity FIRST, for every role. A "
+        "trivial or simple ticket should generally use cheap/fast models across "
+        "ALL four roles — Developer included. Only complex/very_complex tickets "
+        "justify reaching for your strongest available models.\n"
+        "- Within a given ticket, preserve this relative ordering across roles: "
+        "Developer's model should be at least as strong as Planner's and "
+        "Reviewer's; Planner and Reviewer should be roughly comparable to each "
+        "other; Knowledge should generally be the cheapest of the four, since "
+        "it's mostly extraction and summarization rather than judgment. This "
+        "ordering applies at every complexity level — it does not mean Developer "
+        "always gets the top-tier model, only that Developer is never the "
+        "weakest link relative to the other three.\n"
+        "- On complex or very_complex tickets, Planner and Reviewer should also be"
+        "pulled toward the stronger end of the available range — not just below"
+        "Developer, but genuinely capable of the harder reasoning those tickets"
+        "require. Don't satisfy the ordering rule by leaving them mid-tier while"
+        "only Developer scales up.\n"
+        "- Do not default to the most powerful model out of caution. If a "
+        "cheaper model can competently handle a role's demonstrated need for "
+        "this specific ticket, use it — treat an unnecessarily powerful pick as "
+        "a mistake, not a safe choice.\n"
+        "- A required capability (e.g. image_generation) should only push up "
+        "the model choice for the role that actually needs it — it is not a "
+        "reason to upgrade the other three roles.\n"
+        "- You MUST pick model IDs exactly as they appear in the table above, "
+        "copied verbatim. Do not invent, abbreviate, or paraphrase model IDs.\n"
+        "- If only one model is available, use it for all roles — that reflects "
+        "the candidate pool, not something about the ticket.\n\n"
 
         f"## Ticket\n\n{ticket_text}\n\n"
 
@@ -280,7 +299,7 @@ def select_models_for_ticket(
         response = litellm.completion(
             model=selector_model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
+            max_tokens=100000,
             temperature=0.0,
             timeout=60,
         )
@@ -315,6 +334,7 @@ def select_models_for_ticket(
 
     # -- Validate and sanitise selection --------------------------------------
     selection: dict[str, str] = parsed.get("selection") or {}
+    print(selection)
     if not isinstance(selection, dict):
         selection = {}
 
@@ -369,7 +389,7 @@ MODEL_SELECTION_FILE = "model_selection.json"
 
 
 def _load_selector_model_id() -> str:
-    """Read the model_selector key from model_selection.json."""
+    """Read and validate the model_selector key from model_selection.json."""
     try:
         raw = json.loads(open(MODEL_SELECTION_FILE, encoding="utf-8").read())
     except (FileNotFoundError, json.JSONDecodeError) as exc:
@@ -384,7 +404,30 @@ def _load_selector_model_id() -> str:
             status_code=502,
             detail=f"model_selector key is missing or invalid in {MODEL_SELECTION_FILE}",
         )
-    return model_id.strip()
+    model_id = model_id.strip()
+
+    available_ids = {entry["id"] for entry in AVAILABLE_MODELS}
+    if model_id not in available_ids:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Configured model_selector '{model_id}' is not in AVAILABLE_MODELS. "
+                f"Update {MODEL_SELECTION_FILE} to one of the configured models."
+            ),
+        )
+
+    registry_entry = next(entry for entry in AVAILABLE_MODELS if entry["id"] == model_id)
+    env_var = registry_entry.get("requires_env", "")
+    if env_var and not os.getenv(env_var):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Configured model_selector '{model_id}' requires {env_var}, "
+                "but that environment variable is not set."
+            ),
+        )
+
+    return model_id
 
 
 # -- /select-models endpoint ------------------------------------------------

@@ -32,14 +32,6 @@ class AvailableModel(TypedDict):
 
 AVAILABLE_MODELS: list[AvailableModel] = [
     {
-        "id": "groq/llama-3.3-70b-versatile",
-        "label": "llama-3.3-70b-versatile (Groq, fast/cheap)",
-        "provider": "groq",
-        "requires_env": "GROQ_API_KEY",
-        "capabilities": "general-purpose, instruction-following, code generation, reasoning",
-        "power": 3,
-    },
-    {
         "id": "deepseek/deepseek-v4-pro",
         "label": "DeepSeek V4 Pro (DeepSeek, strong reasoning/coding)",
         "provider": "deepseek",
@@ -63,4 +55,13 @@ AVAILABLE_MODELS: list[AvailableModel] = [
         "capabilities": "fast inference, code generation, instruction-following",
         "power": 4,
     },
+    {
+        "id": "groq/llama-3.3-70b-versatile",
+        "label": "Llama 3.3 70B Versatile (Groq, fast/cheap)",
+        "provider": "groq",
+        "requires_env": "GROQ_API_KEY",
+        "capabilities": "fast inference, code generation, instruction-following",
+        "power": 4,
+    },
+
 ]

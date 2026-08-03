@@ -10,7 +10,7 @@ import { FormsModule } from '@angular/forms';
 import { WorkflowStateService } from '../../services/workflow-state.service';
 
 /** Pipeline order for display. */
-const AGENT_DISPLAY_ORDER = ['knowledge', 'planner', 'developer', 'reviewer'] as const;
+const AGENT_DISPLAY_ORDER = ['knowledge', 'planner', 'developer', 'reviewer', 'model_selector'] as const;
 
 /** Human-readable labels. */
 const AGENT_LABELS: Record<string, string> = {
@@ -18,6 +18,7 @@ const AGENT_LABELS: Record<string, string> = {
   planner: 'Planner',
   developer: 'Developer',
   reviewer: 'Reviewer',
+  model_selector: 'Model Selector',
 };
 
 @Component({
