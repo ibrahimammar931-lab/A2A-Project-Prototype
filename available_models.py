@@ -61,7 +61,24 @@ AVAILABLE_MODELS: list[AvailableModel] = [
         "provider": "groq",
         "requires_env": "GROQ_API_KEY",
         "capabilities": "fast inference, code generation, instruction-following",
-        "power": 4,
+        "power": 3,
     },
+    {
+        "id": "groq/openai/gpt-oss-20b",
+        "label": "GPT-OSS 20B (Groq, fast/cheap)",
+        "provider": "groq",
+        "requires_env": "GROQ_API_KEY",
+        "capabilities": "fast inference, code generation, instruction-following",
+        "power": 2,
+    },
+    {
+        "id": "openrouter/qwen/qwen3.7-flash",
+        "label": "Qwen 3.7 Flash (via OpenRouter)",
+        "provider": "openrouter",
+        "requires_env": "OPENROUTER_API_KEY",
+        "capabilities": "code generation, reasoning",
+        "power": 3,
+    },
+
 
 ]

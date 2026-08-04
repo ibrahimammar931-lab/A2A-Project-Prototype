@@ -29,7 +29,7 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from available_models import AVAILABLE_MODELS, AvailableModel
-from config import configure_logging
+from config import LLM_MAX_TOKENS, configure_logging
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -299,7 +299,7 @@ def select_models_for_ticket(
         response = litellm.completion(
             model=selector_model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=100000,
+            max_tokens=min(10000, LLM_MAX_TOKENS),
             temperature=0.0,
             timeout=60,
         )

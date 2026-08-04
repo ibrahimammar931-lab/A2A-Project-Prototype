@@ -403,7 +403,7 @@ class ManualWorkflowController:
             await post_or_raise(
                 client,
                 f"{KNOWLEDGE_SERVICE_URL}/sync-branches",
-                {"repository_path": repo.path},
+                {"repository_path": repo.path, "model": current_model_selection.get("knowledge")},
                 "Knowledge sync-branches",
             )
 

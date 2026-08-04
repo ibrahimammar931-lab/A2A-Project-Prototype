@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 
 from config import (
     GROQ_API_KEY,
+    LLM_MAX_TOKENS,
     GROQ_MODEL,
     check_config,
     configure_logging,
@@ -184,6 +185,7 @@ class DeveloperAgent:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
+            max_tokens=LLM_MAX_TOKENS,
             response_format={"type": "json_object"},
         )
 

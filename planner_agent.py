@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 
 from config import (
     GROQ_API_KEY,
+    LLM_MAX_TOKENS,
     GROQ_PLANNER_MODEL,
     check_config,
     configure_logging,
@@ -155,6 +156,7 @@ class PlannerAgent:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
+            max_tokens=LLM_MAX_TOKENS,
             response_format={"type": "json_object"},
         )
 

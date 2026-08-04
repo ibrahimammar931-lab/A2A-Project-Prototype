@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Tuple
 import litellm
 from fastapi import FastAPI, HTTPException
 
-from config import GROQ_API_KEY, GROQ_MODEL, check_config, configure_logging
+from config import GROQ_API_KEY, LLM_MAX_TOKENS, GROQ_MODEL, check_config, configure_logging
 from schemas import FileChange
 
 configure_logging()
@@ -176,7 +176,12 @@ class KnowledgeAgent:
 
     # -- Drift refresh (shared) ---------------------------------------------
 
-    def _refresh_if_drifted(self, repository_path: str, branch: str) -> Tuple[Dict[str, Any], bool]:
+    def _refresh_if_drifted(
+        self,
+        repository_path: str,
+        branch: str,
+        model: str | None = None,
+    ) -> Tuple[Dict[str, Any], bool]:
         """Bring a branch's knowledge up to date with its current HEAD, if needed.
 
         Compares the branch's stored ``source_sha`` against its actual
@@ -215,7 +220,7 @@ class KnowledgeAgent:
 
         if not stored_sha:
             # No baseline to diff against — rebuild fully.
-            return self.build_knowledge(repository_path, branch), True
+            return self.build_knowledge(repository_path, branch, model=model), True
 
         try:
             changed_files_raw = _run_git(repo, ["diff", "--name-only", stored_sha, current_sha])
@@ -227,7 +232,7 @@ class KnowledgeAgent:
                 current_sha,
                 branch,
             )
-            return self.build_knowledge(repository_path, branch), True
+            return self.build_knowledge(repository_path, branch, model=model), True
 
         changed_paths = [p.strip() for p in changed_files_raw.splitlines() if p.strip()]
 
@@ -261,7 +266,7 @@ class KnowledgeAgent:
             FileChange(path=path, action="update", content=None) for path in changed_paths
         ]
 
-        result = self.update_knowledge(repository_path, branch, changes)
+        result = self.update_knowledge(repository_path, branch, changes, model=model)
         return result["metadata"], True
 
     # -- Public API (branch-scoped) ----------------------------------------
@@ -311,8 +316,8 @@ class KnowledgeAgent:
                     # Refresh the parent first so we copy a baseline that
                     # reflects its true current state, not a stale one that
                     # predates commits which have since landed on GitHub.
-                    self._refresh_if_drifted(repository_path, known_parent)
-                    self._copy_branch_knowledge(repository_path, known_parent, branch)
+                    self._refresh_if_drifted(repository_path, known_parent, model=model)
+                    self._copy_branch_knowledge(repository_path, known_parent, branch, model=model)
                     return self.load_knowledge(repository_path, branch)
                 logger.info(
                     "Known parent '%s' has no knowledge either — falling back to full build for %s",
@@ -342,7 +347,7 @@ class KnowledgeAgent:
         logger.info("Loading existing knowledge for %s (branch %s)", repository_path, branch)
         # The branch may have moved on GitHub since knowledge was last built
         # or updated — refresh any drift before handing knowledge back.
-        self._refresh_if_drifted(repository_path, branch)
+        self._refresh_if_drifted(repository_path, branch, model=model)
         return self.load_knowledge(repository_path, branch)
 
     def build_knowledge(self, repository_path: str, branch: str, model: str | None = None) -> Dict[str, Any]:
@@ -422,6 +427,7 @@ class KnowledgeAgent:
         repository_path: str,
         source_branch: str,
         new_branch: str,
+        model: str | None = None,
     ) -> Dict[str, Any]:
         """Copy an existing branch's knowledge into a new branch's knowledge
         directory via a plain filesystem copy — no LLM calls. Used when a new
@@ -502,7 +508,7 @@ class KnowledgeAgent:
                     changes: List[FileChange] = [
                         FileChange(path=path, action="update", content=None) for path in changed_paths
                     ]
-                    update_result = self.update_knowledge(repository_path, new_branch, changes)
+                    update_result = self.update_knowledge(repository_path, new_branch, changes, model=model)
                     metadata = update_result["metadata"]
             except RuntimeError as exc:
                 logger.warning(
@@ -661,7 +667,7 @@ class KnowledgeAgent:
             shutil.rmtree(knowledge_dir)
             logger.info("Deleted knowledge directory for branch %s: %s", branch, knowledge_dir)
 
-    def sync_all_branches(self, repository_path: str) -> Dict[str, Any]:
+    def sync_all_branches(self, repository_path: str, model: str | None = None) -> Dict[str, Any]:
         """Bring every branch's knowledge in sync with the current git state.
 
         For brand-new branches that have no knowledge folder yet, this
@@ -758,20 +764,20 @@ class KnowledgeAgent:
                     # an up-to-date baseline, then let _copy_branch_knowledge's
                     # own catch-up refresh handle any commits already on
                     # `branch` beyond that baseline.
-                    self._refresh_if_drifted(repository_path, default_base)
-                    self._copy_branch_knowledge(repository_path, default_base, branch)
+                    self._refresh_if_drifted(repository_path, default_base, model=model)
+                    self._copy_branch_knowledge(repository_path, default_base, branch, model=model)
                 else:
                     logger.info(
                         "Sync: building knowledge for new branch %s (no base to copy from)",
                         branch,
                     )
-                    self.build_knowledge(repository_path, branch)
+                    self.build_knowledge(repository_path, branch, model=model)
                 created.append(branch)
                 continue
 
             # Branch exists and has knowledge — refresh it if it has drifted,
             # using the same shared logic ensure_knowledge relies on.
-            _metadata, drifted = self._refresh_if_drifted(repository_path, branch)
+            _metadata, drifted = self._refresh_if_drifted(repository_path, branch, model=model)
             if drifted:
                 updated.append(branch)
             else:
@@ -851,6 +857,7 @@ class KnowledgeAgent:
                 model=selected_model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user_prompt}],
                 temperature=0.0,
+                max_tokens=LLM_MAX_TOKENS,
                 response_format={"type": "json_object"},
             )
 
@@ -973,7 +980,8 @@ def sync_branches_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     try:
         repository_path = payload["repository_path"]
-        return agent.sync_all_branches(repository_path)
+        model = payload.get("model")
+        return agent.sync_all_branches(repository_path, model=model)
     except Exception as exc:
         logger.exception("sync_branches failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc

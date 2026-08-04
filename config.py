@@ -21,6 +21,25 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL") or os.getenv("A2A_DEFAULT_MODEL") or _first_configured_model()
 GROQ_REVIEWER_MODEL = os.getenv("GROQ_REVIEWER_MODEL") or GROQ_MODEL
 GROQ_PLANNER_MODEL = os.getenv("GROQ_PLANNER_MODEL") or GROQ_MODEL
+GROQ_MAX_COMPLETION_TOKENS = 65536
+
+
+def _bounded_int_env(name: str, default: int, upper_bound: int) -> int:
+    raw_value = os.getenv(name)
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+    return max(1, min(value, upper_bound))
+
+
+LLM_MAX_TOKENS = _bounded_int_env(
+    "A2A_LLM_MAX_TOKENS",
+    default=32768,
+    upper_bound=GROQ_MAX_COMPLETION_TOKENS,
+)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
