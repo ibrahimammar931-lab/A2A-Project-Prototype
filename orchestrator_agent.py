@@ -917,14 +917,21 @@ def _load_model_selection() -> dict[str, str | None]:
     if no override has been saved yet or the saved model is no longer in
     AVAILABLE_MODELS. Missing keys are filled with None from
     _model_selection_defaults.
+
+    If any stale model ids (not in AVAILABLE_MODELS) are found in the file,
+    they are sanitized to None and the file is rewritten immediately so the
+    invalid entries are gone from disk on the next load — no manual cleanup
+    required.
     """
     available_ids = {entry["id"] for entry in AVAILABLE_MODELS}
     try:
-        raw = json.loads(open(MODEL_SELECTION_FILE, encoding="utf-8").read())
+        with open(MODEL_SELECTION_FILE, encoding="utf-8") as f:
+            raw = json.loads(f.read())
     except (FileNotFoundError, json.JSONDecodeError):
         return dict(_model_selection_defaults)
 
     result: dict[str, str | None] = {}
+    needs_save = False
     for key in ALL_MODEL_SELECTION_KEYS:
         val = raw.get(key)
         if isinstance(val, str) and val.strip():
@@ -933,13 +940,19 @@ def _load_model_selection() -> dict[str, str | None]:
                 result[key] = model_id
             else:
                 logger.warning(
-                    "Ignoring saved model selection for %s: %s is not in AVAILABLE_MODELS",
+                    "Ignoring saved model selection for %s: %s is not in "
+                    "AVAILABLE_MODELS — sanitizing file",
                     key,
                     model_id,
                 )
                 result[key] = None
+                needs_save = True
         else:
             result[key] = None
+
+    if needs_save:
+        _save_model_selection(result)
+
     return result
 
 
