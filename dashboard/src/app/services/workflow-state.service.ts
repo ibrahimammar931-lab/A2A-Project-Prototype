@@ -1,7 +1,7 @@
 import { HttpClient } from '@angular/common/http';
 import { Injectable, computed, effect, inject, signal } from '@angular/core';
 import { Observable, Subject, catchError, interval, of, startWith, switchMap, tap } from 'rxjs';
-import { AgentMessage, AgentNode, WorkflowCommandResult, WorkflowSnapshot, WorkflowMode } from '../models/workflow.models';
+import { AgentMessage, AgentNode, WorkflowCommandResult, WorkflowSnapshot, WorkflowMode, WorkspaceMode } from '../models/workflow.models';
 
 const API_BASE = '/api/workflow';
 const WS_URL = 'ws://localhost:8010/ws/workflow';
@@ -128,14 +128,18 @@ export class WorkflowStateService {
     baseBranch = this.summary().branch,
     existingBranch = '',
     openPr = true,
-    repoUrl = ''
+    repoUrl = '',
+    workspaceMode: WorkspaceMode = 'git',
+    localPath = ''
   ): void {
     this.command('start', {
       issue_key: issueKey,
       base_branch: baseBranch,
       existing_branch: existingBranch,
       open_pr: openPr,
-      repo_url: repoUrl
+      repo_url: repoUrl,
+      workspace_mode: workspaceMode,
+      local_path: localPath
     });
     if (this.isManualMode()) {
       this.patchSummary({ status: 'waiting', runningAgent: 'None', currentAction: 'Workflow started. Jira is waiting for approval.' });
@@ -159,13 +163,15 @@ export class WorkflowStateService {
     this.patchSummary({ status: 'failed', currentAction: 'Workflow stopped' });
   }
 
-  restartWorkflow(existingBranch = '', openPr = true, repoUrl = ''): void {
+  restartWorkflow(existingBranch = '', openPr = true, repoUrl = '', workspaceMode: WorkspaceMode = 'git', localPath = ''): void {
     this.command('restart', {
       issue_key: this.summary().ticket,
       base_branch: this.summary().branch,
       existing_branch: existingBranch,
       open_pr: openPr,
-      repo_url: repoUrl
+      repo_url: repoUrl,
+      workspace_mode: workspaceMode,
+      local_path: localPath
     });
     this.snapshot.set(createMockSnapshot());
   }
@@ -333,6 +339,7 @@ function createMockSnapshot(): WorkflowSnapshot {
       totalExecutionTime: '00:18:42',
       progress: 56,
       manualMode: true,
+      workspaceMode: 'git',
       previousAgent: 'Planner',
       currentAgent: 'Developer',
       nextAgent: 'Reviewer'

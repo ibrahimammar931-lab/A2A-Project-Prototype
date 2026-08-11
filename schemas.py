@@ -21,6 +21,8 @@ class GenerateRequest(BaseModel):
     existing_branch: str = ""
     open_pr: bool = True
     repo_url: str = ""
+    workspace_mode: Literal["git", "local"] = "git"
+    local_path: str = ""
 
     @model_validator(mode="after")
     def validate_branch_exclusivity(self):
@@ -243,6 +245,8 @@ class GenerateResponse(BaseModel):
 
 class PrepareRepoRequest(BaseModel):
     repo_url: str | None = None
+    workspace_mode: Literal["git", "local"] = "git"
+    local_path: str | None = None
 
 
 class CreateBranchRequest(BaseModel):
@@ -261,6 +265,8 @@ class ReadFilesRequest(BaseModel):
     # branch's remote ref before reading. Optional so any existing caller
     # that doesn't pass it keeps working exactly as before.
     branch: str | None = None
+    workspace_mode: Literal["git", "local"] = "git"
+    local_path: str | None = None
 
 
 class ReadFilesResponse(BaseModel):
@@ -271,8 +277,10 @@ class ReadFilesResponse(BaseModel):
 class ApplyChangesRequest(BaseModel):
     repo_url: str
     changes: list[FileChange]
-    branch: str
+    branch: str | None = None
     commit_message: str | None = None
+    workspace_mode: Literal["git", "local"] = "git"
+    local_path: str | None = None
 
 
 class ApplyChangesResponse(BaseModel):
@@ -284,6 +292,8 @@ class ApplyChangesResponse(BaseModel):
 
 class RepoDiffRequest(BaseModel):
     repo_url: str
+    workspace_mode: Literal["git", "local"] = "git"
+    local_path: str | None = None
 
 
 class RepoDiffResponse(BaseModel):

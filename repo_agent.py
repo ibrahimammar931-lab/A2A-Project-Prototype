@@ -260,6 +260,23 @@ def existing_repo_path(repo_id: str) -> Path:
     return repo_path
 
 
+def local_repo_path(local_path: str | None) -> Path:
+    if not local_path or not local_path.strip():
+        raise ValueError("Missing local_path for local folder mode.")
+    repo_path = Path(local_path).expanduser().resolve()
+    if not repo_path.exists():
+        raise ValueError(f"Local folder does not exist: {repo_path}")
+    if not repo_path.is_dir():
+        raise ValueError(f"Local path is not a folder: {repo_path}")
+    if not (repo_path / ".git").exists():
+        raise ValueError(f"Local folder must be a git repository: {repo_path}")
+    return repo_path
+
+
+def local_repo_id(repo_path: Path) -> str:
+    return slugify(f"local-{repo_path.name}")
+
+
 def safe_repo_file(repo_path: Path, relative_path: str) -> Path:
     if Path(relative_path).is_absolute():
         raise ValueError(f"Absolute paths are not allowed: {relative_path}")
@@ -427,6 +444,20 @@ def normalize_change_action(action: str) -> str:
 @app.post("/prepare-repo", response_model=RepoInfo)
 def prepare_repo(request: PrepareRepoRequest) -> RepoInfo:
     try:
+        if request.workspace_mode == "local":
+            repo_path = local_repo_path(request.local_path)
+            try:
+                remote_url = run_git(repo_path, ["remote", "get-url", "origin"])
+            except RuntimeError:
+                remote_url = str(repo_path)
+            return RepoInfo(
+                repo_id=local_repo_id(repo_path),
+                path=str(repo_path),
+                current_branch=current_branch(repo_path),
+                remote_url=remote_url,
+                status="local",
+            )
+
         repo_url = request.repo_url or GITHUB_REPO_URL
         if not repo_url:
             raise ValueError(
@@ -511,8 +542,12 @@ def create_branch(request: CreateBranchRequest) -> BranchResponse:
 @app.post("/read-files", response_model=ReadFilesResponse)
 def read_files(request: ReadFilesRequest) -> ReadFilesResponse:
     try:
-        repo_id = repo_id_from_url(request.repo_url)
-        repo_path = existing_repo_path(repo_id)
+        if request.workspace_mode == "local":
+            repo_path = local_repo_path(request.local_path or request.repo_url)
+            repo_id = local_repo_id(repo_path)
+        else:
+            repo_id = repo_id_from_url(request.repo_url)
+            repo_path = existing_repo_path(repo_id)
 
         # FIX: previously this read directly from whatever happened to be
         # checked out, with no branch awareness and no guarantee the
@@ -523,7 +558,7 @@ def read_files(request: ReadFilesRequest) -> ReadFilesResponse:
         # explicitly check it out (which now also hard-resets to
         # origin/<branch> — see checkout_branch) before reading, so the
         # working tree is guaranteed current before any file is read.
-        if request.branch:
+        if request.workspace_mode != "local" and request.branch:
             checkout_branch(repo_path, request.branch)
 
         files = []
@@ -549,6 +584,31 @@ def read_files(request: ReadFilesRequest) -> ReadFilesResponse:
 @app.post("/apply-changes", response_model=ApplyChangesResponse)
 def apply_changes(request: ApplyChangesRequest) -> ApplyChangesResponse:
     try:
+        if request.workspace_mode == "local":
+            repo_path = local_repo_path(request.local_path or request.repo_url)
+            changed_files = []
+            for change in request.changes:
+                action = normalize_change_action(change.action)
+                file_path = safe_repo_file(repo_path, change.path)
+                if action in {"create", "update", "upsert"}:
+                    if change.content is None:
+                        raise ValueError(f"Missing content for {change.path}")
+                    file_path.parent.mkdir(parents=True, exist_ok=True)
+                    file_path.write_text(change.content, encoding="utf-8")
+                elif action == "delete":
+                    if file_path.exists():
+                        file_path.unlink()
+                else:
+                    raise ValueError(f"Unsupported change action: {change.action}")
+                changed_files.append(change.path)
+
+            return ApplyChangesResponse(
+                repo_id=local_repo_id(repo_path),
+                changed_files=changed_files,
+                branch=current_branch(repo_path) or request.branch or "local",
+                commit_shas=[],
+            )
+
         repo_id = repo_id_from_url(request.repo_url)
         owner, repo = github_owner_repo(request.repo_url)
         branch = request.branch
@@ -614,8 +674,12 @@ def apply_changes(request: ApplyChangesRequest) -> ApplyChangesResponse:
 @app.post("/diff", response_model=RepoDiffResponse)
 def diff(request: RepoDiffRequest) -> RepoDiffResponse:
     try:
-        repo_id = repo_id_from_url(request.repo_url)
-        repo_path = existing_repo_path(repo_id)
+        if request.workspace_mode == "local":
+            repo_path = local_repo_path(request.local_path or request.repo_url)
+            repo_id = local_repo_id(repo_path)
+        else:
+            repo_id = repo_id_from_url(request.repo_url)
+            repo_path = existing_repo_path(repo_id)
         repo_diff = run_git(repo_path, ["diff", "--", "."])
         return RepoDiffResponse(repo_id=repo_id, diff=repo_diff)
     except Exception as exc:

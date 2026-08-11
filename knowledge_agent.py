@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -157,8 +158,15 @@ class KnowledgeAgent:
         slug = _branch_slug(branch)
         return Path(repository_path).resolve() / "knowledge" / slug
 
+    def _local_knowledge_dir(self, repository_path: str, branch: str) -> Path:
+        slug = _branch_slug(branch)
+        return Path(repository_path).resolve() / "knowledge" / "local" / slug
+
     def _files_dir(self, repository_path: str, branch: str) -> Path:
         return self._knowledge_dir(repository_path, branch) / "files"
+
+    def _local_files_dir(self, repository_path: str, branch: str) -> Path:
+        return self._local_knowledge_dir(repository_path, branch) / "files"
 
     def _read_metadata(self, repository_path: str, branch: str) -> dict[str, Any]:
         metadata_path = self._knowledge_dir(repository_path, branch) / "metadata.json"
@@ -173,6 +181,73 @@ class KnowledgeAgent:
         metadata_path = self._knowledge_dir(repository_path, branch) / "metadata.json"
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _read_local_metadata(self, repository_path: str, branch: str) -> dict[str, Any]:
+        metadata_path = self._local_knowledge_dir(repository_path, branch) / "metadata.json"
+        if metadata_path.exists():
+            try:
+                return json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    def _write_local_metadata(self, repository_path: str, branch: str, metadata: dict[str, Any]) -> None:
+        metadata_path = self._local_knowledge_dir(repository_path, branch) / "metadata.json"
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _local_branch(self, repository_path: str, branch: str | None = None) -> str:
+        if branch and branch.strip():
+            return branch.strip()
+        repo = Path(repository_path).resolve()
+        detected = _current_branch(repo)
+        if detected:
+            return detected
+        try:
+            return _run_git(repo, ["rev-parse", "--short", "HEAD"]) or "detached"
+        except RuntimeError:
+            raise ValueError(f"Local mode requires a git repository: {repository_path}")
+
+    def _iter_source_files(self, repo: Path, knowledge_dir: Path):
+        for path in repo.rglob("**/*"):
+            if path == knowledge_dir or knowledge_dir in path.parents:
+                logger.debug("Skipping generated knowledge path: %s", path)
+                continue
+
+            if path.is_dir():
+                if path.name in IGNORED_DIRS:
+                    logger.debug("Skipping ignored directory: %s", path)
+                    continue
+                continue
+
+            if any(part in IGNORED_DIRS for part in path.parts):
+                logger.debug("Skipping path inside ignored dir: %s", path)
+                continue
+
+            if path.suffix.lower() not in SOURCE_EXTENSIONS:
+                continue
+
+            yield path
+
+    def _file_fingerprint(self, path: Path) -> dict[str, Any]:
+        data = path.read_bytes()
+        stat = path.stat()
+        return {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size": stat.st_size,
+            "mtime": datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z",
+        }
+
+    def _scan_local_fingerprints(self, repository_path: str, branch: str) -> dict[str, dict[str, Any]]:
+        repo = Path(repository_path).resolve()
+        fingerprints: dict[str, dict[str, Any]] = {}
+        for path in self._iter_source_files(repo, self._local_knowledge_dir(repository_path, branch)):
+            rel = str(path.relative_to(repo))
+            try:
+                fingerprints[rel] = self._file_fingerprint(path)
+            except Exception:
+                logger.debug("Skipping unreadable file during fingerprint scan: %s", path)
+        return fingerprints
 
     # -- Drift refresh (shared) ---------------------------------------------
 
@@ -274,9 +349,10 @@ class KnowledgeAgent:
     def ensure_knowledge(
         self,
         repository_path: str,
-        branch: str,
+        branch: str | None,
         known_parent: str | None = None,
         model: str | None = None,
+        workspace_mode: str = "git",
     ) -> Dict[str, Any]:
         """Return loaded knowledge; build (or copy from a known parent) if missing.
 
@@ -297,6 +373,12 @@ class KnowledgeAgent:
         so callers always get knowledge that matches the branch's actual
         current HEAD, not whatever it happened to be when it was last built.
         """
+        if workspace_mode == "local":
+            return self.ensure_local_knowledge(repository_path, branch, model=model)
+
+        if not branch:
+            raise ValueError("Missing branch for git knowledge mode.")
+
         repo = Path(repository_path).resolve()
         try:
             _run_git(repo, ["fetch", "--all", "--prune"])
@@ -349,6 +431,27 @@ class KnowledgeAgent:
         # or updated — refresh any drift before handing knowledge back.
         self._refresh_if_drifted(repository_path, branch, model=model)
         return self.load_knowledge(repository_path, branch)
+
+    def ensure_local_knowledge(
+        self,
+        repository_path: str,
+        branch: str | None = None,
+        model: str | None = None,
+    ) -> Dict[str, Any]:
+        branch = self._local_branch(repository_path, branch)
+        knowledge_dir = self._local_knowledge_dir(repository_path, branch)
+        if not knowledge_dir.exists():
+            self.build_local_knowledge(repository_path, branch, model=model)
+            return self.load_local_knowledge(repository_path, branch)
+
+        metadata, changed = self._refresh_local_if_drifted(repository_path, branch, model=model)
+        logger.info(
+            "Loaded local knowledge for %s branch %s (%s)",
+            repository_path,
+            branch,
+            "refreshed" if changed else "unchanged",
+        )
+        return self.load_local_knowledge(repository_path, branch)
 
     def build_knowledge(self, repository_path: str, branch: str, model: str | None = None) -> Dict[str, Any]:
         """Scan repository and build per-file knowledge artifacts (do not store code).
@@ -421,6 +524,90 @@ class KnowledgeAgent:
 
         logger.info("Built knowledge for %s branch %s (%d files, SHA %s)", repository_path, branch, summary_count, source_sha)
         return metadata
+
+    def build_local_knowledge(self, repository_path: str, branch: str | None = None, model: str | None = None) -> Dict[str, Any]:
+        repo = Path(repository_path).resolve()
+        if not repo.exists():
+            raise ValueError(f"Repository path does not exist: {repository_path}")
+        if not (repo / ".git").exists():
+            raise ValueError(f"Local mode requires a git repository: {repository_path}")
+
+        branch = self._local_branch(repository_path, branch)
+        knowledge_dir = self._local_knowledge_dir(repository_path, branch)
+        if knowledge_dir.exists():
+            logger.info("Removing existing local knowledge before rebuild: %s", knowledge_dir)
+            shutil.rmtree(knowledge_dir)
+
+        files_dir = self._local_files_dir(repository_path, branch)
+        files_dir.mkdir(parents=True, exist_ok=True)
+
+        summary_count = 0
+        fingerprints: dict[str, dict[str, Any]] = {}
+        for path in self._iter_source_files(repo, knowledge_dir):
+            try:
+                content = path.read_text(encoding="utf-8")
+            except Exception:
+                logger.debug("Skipping non-text or unreadable file: %s", path)
+                continue
+
+            rel = path.relative_to(repo)
+            rel_key = str(rel)
+            knowledge = self._summarize_file(rel_key, content, model=model)
+            out_file = (files_dir / rel).with_suffix(".json")
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_text(json.dumps(knowledge, ensure_ascii=False, indent=2), encoding="utf-8")
+            fingerprints[rel_key] = self._file_fingerprint(path)
+            summary_count += 1
+
+        metadata = {
+            "version": 1,
+            "mode": "local",
+            "source": "working_tree",
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "repository": str(repo),
+            "branch": branch,
+            "files": summary_count,
+            "fingerprints": fingerprints,
+        }
+        self._write_local_metadata(repository_path, branch, metadata)
+        logger.info("Built local knowledge for %s branch %s (%d files)", repository_path, branch, summary_count)
+        return metadata
+
+    def _refresh_local_if_drifted(
+        self,
+        repository_path: str,
+        branch: str | None = None,
+        model: str | None = None,
+    ) -> Tuple[Dict[str, Any], bool]:
+        branch = self._local_branch(repository_path, branch)
+        metadata = self._read_local_metadata(repository_path, branch)
+        stored = metadata.get("fingerprints") or {}
+        current = self._scan_local_fingerprints(repository_path, branch)
+
+        changed_paths = [
+            path for path, fingerprint in current.items()
+            if stored.get(path) != fingerprint
+        ]
+        removed_paths = [path for path in stored if path not in current]
+
+        if not changed_paths and not removed_paths:
+            return metadata, False
+
+        changes = [
+            FileChange(path=path, action="update", content=None)
+            for path in changed_paths
+        ] + [
+            FileChange(path=path, action="delete", content=None)
+            for path in removed_paths
+        ]
+        result = self.update_knowledge(
+            repository_path,
+            branch,
+            changes,
+            model=model,
+            workspace_mode="local",
+        )
+        return result["metadata"], True
 
     def _copy_branch_knowledge(
         self,
@@ -528,7 +715,14 @@ class KnowledgeAgent:
         )
         return metadata
 
-    def update_knowledge(self, repository_path: str, branch: str, changes: List[FileChange], model: str | None = None) -> Dict[str, Any]:
+    def update_knowledge(
+        self,
+        repository_path: str,
+        branch: str | None,
+        changes: List[FileChange],
+        model: str | None = None,
+        workspace_mode: str = "git",
+    ) -> Dict[str, Any]:
         """Update knowledge for the provided changed files only.
 
         Updates ``source_sha`` in metadata to the branch's current HEAD.
@@ -547,6 +741,12 @@ class KnowledgeAgent:
         repo = Path(repository_path).resolve()
         if not repo.exists():
             raise ValueError(f"Repository path does not exist: {repository_path}")
+
+        if workspace_mode == "local":
+            return self.update_local_knowledge(repository_path, branch, changes, model=model)
+
+        if not branch:
+            raise ValueError("Missing branch for git knowledge mode.")
 
         files_dir = self._files_dir(repository_path, branch)
         files_dir.mkdir(parents=True, exist_ok=True)
@@ -630,12 +830,100 @@ class KnowledgeAgent:
         logger.info("Knowledge update complete for branch %s: %d updated, %d removed (SHA %s)", branch, updated, removed, source_sha)
         return {"updated": updated, "removed": removed, "metadata": metadata}
 
+    def update_local_knowledge(
+        self,
+        repository_path: str,
+        branch: str | None,
+        changes: List[FileChange],
+        model: str | None = None,
+    ) -> Dict[str, Any]:
+        repo = Path(repository_path).resolve()
+        branch = self._local_branch(repository_path, branch)
+        files_dir = self._local_files_dir(repository_path, branch)
+        files_dir.mkdir(parents=True, exist_ok=True)
+
+        updated = 0
+        removed = 0
+        for change in changes:
+            rel_path = Path(change.path)
+            source_file = (repo / rel_path).resolve()
+            if repo != source_file and repo not in source_file.parents:
+                logger.warning("Skipping knowledge update for path outside repo: %s", change.path)
+                continue
+
+            knowledge_file = (files_dir / rel_path).with_suffix(".json")
+            action = change.action.lower().strip()
+            if action in {"delete", "removed"}:
+                if knowledge_file.exists():
+                    knowledge_file.unlink()
+                    removed += 1
+                continue
+
+            if change.content is not None:
+                content = change.content
+            else:
+                if not source_file.is_file():
+                    if knowledge_file.exists():
+                        knowledge_file.unlink()
+                        removed += 1
+                    continue
+                try:
+                    content = source_file.read_text(encoding="utf-8")
+                except Exception:
+                    logger.debug("Skipping non-text or unreadable file: %s", source_file)
+                    continue
+
+            knowledge = self._summarize_file(str(rel_path), content, model=model)
+            knowledge_file.parent.mkdir(parents=True, exist_ok=True)
+            knowledge_file.write_text(json.dumps(knowledge, ensure_ascii=False, indent=2), encoding="utf-8")
+            updated += 1
+
+        metadata = self._read_local_metadata(repository_path, branch)
+        metadata["version"] = 1
+        metadata["mode"] = "local"
+        metadata["source"] = "working_tree"
+        metadata["generated_at"] = datetime.utcnow().isoformat() + "Z"
+        metadata["repository"] = str(repo)
+        metadata["branch"] = branch
+        metadata["fingerprints"] = self._scan_local_fingerprints(repository_path, branch)
+        metadata["files"] = len(list(files_dir.rglob("*.json")))
+        self._write_local_metadata(repository_path, branch, metadata)
+
+        logger.info("Local knowledge update complete for branch %s: %d updated, %d removed", branch, updated, removed)
+        return {"updated": updated, "removed": removed, "metadata": metadata}
+
     def load_knowledge(self, repository_path: str, branch: str) -> Dict[str, Any]:
         knowledge_dir = self._knowledge_dir(repository_path, branch)
         if not knowledge_dir.exists():
             raise ValueError("Knowledge not found; build it first.")
 
         files_dir = knowledge_dir / "files"
+        result: Dict[str, Any] = {"metadata": {}, "files": {}}
+        metadata_path = knowledge_dir / "metadata.json"
+        if metadata_path.exists():
+            try:
+                result["metadata"] = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                result["metadata"] = {}
+
+        if files_dir.exists():
+            for p in files_dir.rglob("*.json"):
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                key = data.get("path") or str(p.relative_to(files_dir))
+                result["files"][key] = data
+
+        return result
+
+    def load_local_knowledge(self, repository_path: str, branch: str | None = None) -> Dict[str, Any]:
+        branch = self._local_branch(repository_path, branch)
+        knowledge_dir = self._local_knowledge_dir(repository_path, branch)
+        if not knowledge_dir.exists():
+            raise ValueError("Local knowledge not found; build it first.")
+
+        files_dir = self._local_files_dir(repository_path, branch)
         result: Dict[str, Any] = {"metadata": {}, "files": {}}
         metadata_path = knowledge_dir / "metadata.json"
         if metadata_path.exists():
@@ -721,6 +1009,8 @@ class KnowledgeAgent:
         if knowledge_root.exists():
             for entry in knowledge_root.iterdir():
                 if entry.is_dir():
+                    if entry.name == "local":
+                        continue
                     # Map back from slug to branch name: this is lossy (two
                     # different branch names could slug to the same dir), but
                     # since the original branch name is preserved in
@@ -919,10 +1209,11 @@ agent = KnowledgeAgent()
 def ensure_knowledge_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         repository_path = payload["repository_path"]
-        branch = payload["branch"]
+        branch = payload.get("branch")
         known_parent = payload.get("known_parent")
         model = payload.get("model")
-        return agent.ensure_knowledge(repository_path, branch, known_parent, model=model)
+        workspace_mode = payload.get("workspace_mode", "git")
+        return agent.ensure_knowledge(repository_path, branch, known_parent, model=model, workspace_mode=workspace_mode)
     except Exception as exc:
         logger.exception("ensure_knowledge failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -932,8 +1223,12 @@ def ensure_knowledge_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
 def build_knowledge_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         repository_path = payload["repository_path"]
-        branch = payload["branch"]
+        branch = payload.get("branch")
         model = payload.get("model")
+        if payload.get("workspace_mode") == "local":
+            return agent.build_local_knowledge(repository_path, branch, model=model)
+        if not branch:
+            raise ValueError("Missing branch for git knowledge mode.")
         return agent.build_knowledge(repository_path, branch, model=model)
     except Exception as exc:
         logger.exception("build_knowledge failed")
@@ -944,18 +1239,23 @@ def build_knowledge_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
 def update_knowledge_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         repository_path = payload["repository_path"]
-        branch = payload["branch"]
+        branch = payload.get("branch")
         model = payload.get("model")
         changes = [FileChange(**c) for c in payload.get("changes", [])]
-        return agent.update_knowledge(repository_path, branch, changes, model=model)
+        workspace_mode = payload.get("workspace_mode", "git")
+        return agent.update_knowledge(repository_path, branch, changes, model=model, workspace_mode=workspace_mode)
     except Exception as exc:
         logger.exception("update_knowledge failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/load-knowledge")
-def load_knowledge_endpoint(repository_path: str, branch: str) -> Dict[str, Any]:
+def load_knowledge_endpoint(repository_path: str, branch: str | None = None, workspace_mode: str = "git") -> Dict[str, Any]:
     try:
+        if workspace_mode == "local":
+            return agent.load_local_knowledge(repository_path, branch)
+        if not branch:
+            raise ValueError("Missing branch for git knowledge mode.")
         return agent.load_knowledge(repository_path, branch)
     except Exception as exc:
         logger.exception("load_knowledge failed")
@@ -981,6 +1281,17 @@ def sync_branches_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         repository_path = payload["repository_path"]
         model = payload.get("model")
+        if payload.get("workspace_mode") == "local":
+            before = agent._read_local_metadata(repository_path, agent._local_branch(repository_path, payload.get("branch")))
+            agent.ensure_local_knowledge(repository_path, payload.get("branch"), model=model)
+            after = agent._read_local_metadata(repository_path, agent._local_branch(repository_path, payload.get("branch")))
+            branch = after.get("branch") or payload.get("branch") or "local"
+            return {
+                "created": [branch] if not before else [],
+                "updated": [branch] if before and before != after else [],
+                "deleted": [],
+                "unchanged": [] if before != after else [branch],
+            }
         return agent.sync_all_branches(repository_path, model=model)
     except Exception as exc:
         logger.exception("sync_branches failed")

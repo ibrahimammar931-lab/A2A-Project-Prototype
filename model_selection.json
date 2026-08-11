@@ -1,7 +1,7 @@
 {
-  "knowledge": "groq/llama-3.3-70b-versatile",
-  "planner": "openrouter/qwen/qwen3.7-flash",
+  "knowledge": "deepseek/deepseek-v4-flash",
+  "planner": "deepseek/deepseek-v4-flash",
   "developer": "deepseek/deepseek-v4-flash",
-  "reviewer": "openrouter/qwen/qwen3.7-flash",
-  "model_selector": "groq/llama-3.3-70b-versatile"
+  "reviewer": "deepseek/deepseek-v4-flash",
+  "model_selector": null
 }

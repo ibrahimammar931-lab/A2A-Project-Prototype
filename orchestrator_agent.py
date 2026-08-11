@@ -165,6 +165,8 @@ class ManualWorkflowController:
         self.existing_branch = ""
         self.open_pr = True
         self.repo_url = ""
+        self.workspace_mode = "git"
+        self.local_path = ""
         self.status = "waiting"
         self.current_action = "Ready to start manual workflow."
         self.running_agent = "None"
@@ -260,6 +262,8 @@ class ManualWorkflowController:
         existing_branch: str | None = None,
         open_pr: bool | None = None,
         repo_url: str | None = None,
+        workspace_mode: str | None = None,
+        local_path: str | None = None,
     ) -> None:
         # Validate mutual exclusivity based ONLY on what was explicitly passed
         # into *this* call. Checking against the merged/fallback state (the
@@ -301,6 +305,11 @@ class ManualWorkflowController:
         self.existing_branch = existing_branch if existing_branch is not None else self.existing_branch
         self.open_pr = open_pr if open_pr is not None else self.open_pr
         self.repo_url = repo_url if repo_url is not None else self.repo_url
+        if workspace_mode is not None:
+            self.workspace_mode = workspace_mode if workspace_mode in {"git", "local"} else "git"
+        self.local_path = local_path if local_path is not None else self.local_path
+        if self.workspace_mode == "local":
+            self.open_pr = False
         self.status = "waiting"
         self.current_action = "Workflow started in manual mode. Jira is waiting for approval."
         self.running_agent = "None"
@@ -314,6 +323,9 @@ class ManualWorkflowController:
         self.messages = []
         self.active_path = []
         self.current_task = None
+
+    def _is_local_mode(self) -> bool:
+        return self.workspace_mode == "local"
 
     def request_stop(self, reason: str) -> None:
         """Interrupts whatever step is currently executing, if any, and marks
@@ -393,19 +405,20 @@ class ManualWorkflowController:
             # We prepare the repo early (idempotent call) just to get the
             # repository path for the sync; _run_repo_initial will call
             # prepare-repo again later for the actual branch setup.
-            repo_response = await post_or_raise(
-                client,
-                f"{REPO_SERVICE_URL}/prepare-repo",
-                PrepareRepoRequest(repo_url=self.repo_url or None).model_dump(),
-                "Repo prepare (pre-sync)",
-            )
-            repo = RepoInfo(**repo_response.json())
-            await post_or_raise(
-                client,
-                f"{KNOWLEDGE_SERVICE_URL}/sync-branches",
-                {"repository_path": repo.path, "model": current_model_selection.get("knowledge")},
-                "Knowledge sync-branches",
-            )
+            if not self._is_local_mode():
+                repo_response = await post_or_raise(
+                    client,
+                    f"{REPO_SERVICE_URL}/prepare-repo",
+                    PrepareRepoRequest(repo_url=self.repo_url or None).model_dump(),
+                    "Repo prepare (pre-sync)",
+                )
+                repo = RepoInfo(**repo_response.json())
+                await post_or_raise(
+                    client,
+                    f"{KNOWLEDGE_SERVICE_URL}/sync-branches",
+                    {"repository_path": repo.path, "model": current_model_selection.get("knowledge")},
+                    "Knowledge sync-branches",
+                )
 
             response = await client.get(f"{JIRA_SERVICE_URL}/tickets/{self.issue_key}")
             response.raise_for_status()
@@ -420,12 +433,22 @@ class ManualWorkflowController:
             response = await post_or_raise(
                 client,
                 f"{REPO_SERVICE_URL}/prepare-repo",
-                PrepareRepoRequest(repo_url=self.repo_url or None).model_dump(),
+                PrepareRepoRequest(
+                    repo_url=self.repo_url or None,
+                    workspace_mode=self.workspace_mode,
+                    local_path=self.local_path or None,
+                ).model_dump(),
                 "Repo prepare",
             )
             repo = RepoInfo(**response.json())
 
-            if self.existing_branch:
+            if self._is_local_mode():
+                branch = BranchResponse(
+                    repo_id=repo.repo_id,
+                    branch=repo.current_branch or "local",
+                    base_branch=repo.current_branch or "local",
+                )
+            elif self.existing_branch:
                 branch = BranchResponse(
                     repo_id=repo.repo_id,
                     branch=self.existing_branch,
@@ -464,8 +487,9 @@ class ManualWorkflowController:
                 {
                     "repository_path": repo.path,
                     "branch": branch.branch,
-                    "known_parent": branch.base_branch,
+                    "known_parent": None if self._is_local_mode() else branch.base_branch,
                     "model": current_model_selection.get("knowledge"),
+                    "workspace_mode": self.workspace_mode,
                 },
                 "Knowledge ensure",
             )
@@ -518,7 +542,9 @@ class ManualWorkflowController:
                     ReadFilesRequest(
                         repo_url=repo.remote_url,
                         paths=planned_existing_files,
-                        branch=branch.branch,
+                        branch=None if self._is_local_mode() else branch.branch,
+                        workspace_mode=self.workspace_mode,
+                        local_path=repo.path if self._is_local_mode() else None,
                     ).model_dump(),
                     "Repo read-files",
                 )
@@ -664,6 +690,8 @@ class ManualWorkflowController:
                     changes=[change.model_dump() for change in output.changes],
                     branch=branch.branch,
                     commit_message=f"{ticket.key} {ticket.summary}",
+                    workspace_mode=self.workspace_mode,
+                    local_path=repo.path if self._is_local_mode() else None,
                 )
                 apply_response = await post_or_raise(
                     client,
@@ -675,10 +703,16 @@ class ManualWorkflowController:
                 await post_or_raise(
                     client,
                     f"{KNOWLEDGE_SERVICE_URL}/update-knowledge",
-                    {"repository_path": repo.path, "branch": branch.branch, "changes": [change.model_dump() for change in output.changes], "model": current_model_selection.get("knowledge")},
+                    {
+                        "repository_path": repo.path,
+                        "branch": branch.branch,
+                        "changes": [change.model_dump() for change in output.changes],
+                        "model": current_model_selection.get("knowledge"),
+                        "workspace_mode": self.workspace_mode,
+                    },
                     "Knowledge update",
                 )
-                if self.open_pr:
+                if self.open_pr and not self._is_local_mode():
                     pr_response = await post_or_raise(
                         client,
                         f"{REPO_SERVICE_URL}/open-pr",
@@ -806,12 +840,13 @@ class ManualWorkflowController:
                 "status": self._dashboard_status(),
                 "ticket": self.issue_key,
                 "branch": branch.branch if branch else (self.existing_branch or self.base_branch or self.default_base_branch),
-                "repository": repo.remote_url if repo else (self.repo_url or os.getenv("GITHUB_REPO_URL", "Not prepared")),
+                "repository": repo.path if self._is_local_mode() and repo else (repo.remote_url if repo else (self.local_path if self._is_local_mode() else self.repo_url or os.getenv("GITHUB_REPO_URL", "Not prepared"))),
                 "runningAgent": self.running_agent,
                 "currentAction": self.current_action,
                 "totalExecutionTime": elapsed,
                 "progress": round((self.step_index / len(self.steps)) * 100),
                 "manualMode": current_mode == "manual",
+                "workspaceMode": self.workspace_mode,
                 "previousAgent": self.previous_agent,
                 "currentAgent": self.current_agent,
                 "nextAgent": self.next_agent,
@@ -1212,6 +1247,8 @@ async def workflow_start(payload: dict[str, Any] = Body(default_factory=dict)) -
         existing_branch=payload.get("existing_branch"),
         open_pr=payload.get("open_pr"),
         repo_url=payload.get("repo_url"),
+        workspace_mode=payload.get("workspace_mode"),
+        local_path=payload.get("local_path"),
     )
     await manual_workflow.broadcast()
     if current_mode == "automatic":
@@ -1255,12 +1292,16 @@ async def workflow_restart(payload: dict[str, Any] = Body(default_factory=dict))
     base_branch = payload["base_branch"] if "base_branch" in payload else manual_workflow.base_branch
     existing_branch = payload["existing_branch"] if "existing_branch" in payload else manual_workflow.existing_branch
     repo_url = payload["repo_url"] if "repo_url" in payload else manual_workflow.repo_url
+    workspace_mode = payload["workspace_mode"] if "workspace_mode" in payload else manual_workflow.workspace_mode
+    local_path = payload["local_path"] if "local_path" in payload else manual_workflow.local_path
     manual_workflow.reset(
         issue_key=issue_key,
         base_branch=base_branch,
         existing_branch=existing_branch,
         open_pr=payload.get("open_pr") if "open_pr" in payload else manual_workflow.open_pr,
         repo_url=repo_url,
+        workspace_mode=workspace_mode,
+        local_path=local_path,
     )
     await manual_workflow.broadcast()
     return command_result("restart")
