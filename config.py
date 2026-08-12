@@ -58,6 +58,11 @@ GITHUB_REPO_URL = os.getenv("GITHUB_REPO_URL")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_WORKSPACE_ROOT = Path(os.getenv("REPO_WORKSPACE_ROOT", "workspaces"))
 
+GITHUB_REPO_URL = os.getenv("GITHUB_REPO_URL")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+REPO_WORKSPACE_ROOT = Path(os.getenv("REPO_WORKSPACE_ROOT", "workspaces"))
+LOCAL_KNOWLEDGE_ROOT = Path(os.getenv("LOCAL_KNOWLEDGE_ROOT", "local_knowledge_cache"))
+
 
 def check_config() -> None:
     configured_env_vars = {
