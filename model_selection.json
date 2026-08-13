@@ -1,7 +1,7 @@
 {
   "knowledge": "groq/llama-3.3-70b-versatile",
   "planner": "deepseek/deepseek-v4-flash",
-  "developer": "deepseek/deepseek-v4-flash",
+  "developer": "deepseek/deepseek-v4-pro",
   "reviewer": "deepseek/deepseek-v4-flash",
-  "model_selector": null
+  "model_selector": "groq/llama-3.3-70b-versatile"
 }

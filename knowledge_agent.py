@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Tuple
 import litellm
 from fastapi import FastAPI, HTTPException
 
-from config import GROQ_API_KEY, LLM_MAX_TOKENS, GROQ_MODEL,  check_config, configure_logging
+from config import GROQ_API_KEY, LLM_MAX_TOKENS, GROQ_MODEL, LOCAL_KNOWLEDGE_ROOT, check_config, configure_logging
 from schemas import FileChange
 
 configure_logging()
@@ -187,11 +188,13 @@ class KnowledgeAgent:
 
     # -- Branch-scoped directory helpers -----------------------------------
 
+    def _knowledge_root(self, repository_path: str, local: bool = False) -> Path:
+        mode = "local" if local else "git"
+        return LOCAL_KNOWLEDGE_ROOT.resolve() / _local_repo_id(repository_path) / mode
+
     def _knowledge_dir(self, repository_path: str, branch: str, local: bool = False) -> Path:
         slug = _branch_slug(branch)
-        if local:
-            return LOCAL_KNOWLEDGE_ROOT.resolve() / _local_repo_id(repository_path) / slug
-        return Path(repository_path).resolve() / "knowledge" / slug
+        return self._knowledge_root(repository_path, local=local) / slug
 
     def _files_dir(self, repository_path: str, branch: str, local: bool = False) -> Path:
         return self._knowledge_dir(repository_path, branch, local=local) / "files"
@@ -423,9 +426,9 @@ class KnowledgeAgent:
         summary_count = 0
         knowledge_dir = self._knowledge_dir(repository_path, branch, local=local)
         for path in repo.rglob("**/*"):
-            # In local mode knowledge_dir lives outside repo entirely (under
-            # LOCAL_KNOWLEDGE_ROOT), so this check simply never matches —
-            # left unconditional since it's a correct no-op either way.
+            # Knowledge lives outside the worked-on project (under
+            # LOCAL_KNOWLEDGE_ROOT), so this check is normally a no-op. It
+            # still protects older in-project knowledge folders if present.
             if path == knowledge_dir or knowledge_dir in path.parents:
                 logger.debug("Skipping generated knowledge path: %s", path)
                 continue
@@ -803,8 +806,8 @@ class KnowledgeAgent:
         # remote list (e.g. not yet pushed or mid-workflow).
         current = _current_branch(repo)
 
-        # Enumerate knowledge folders that exist on disk
-        knowledge_root = repo / "knowledge"
+        # Enumerate knowledge folders that exist in the app-owned cache.
+        knowledge_root = self._knowledge_root(repository_path)
         existing_knowledge_branches: set[str] = set()
         if knowledge_root.exists():
             for entry in knowledge_root.iterdir():

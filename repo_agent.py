@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import subprocess
 from base64 import b64encode
@@ -263,7 +264,17 @@ def existing_repo_path(repo_id: str) -> Path:
 def local_repo_path(local_path: str | None) -> Path:
     if not local_path or not local_path.strip():
         raise ValueError("Missing local_path for local folder mode.")
-    repo_path = Path(local_path).expanduser().resolve()
+
+    raw_path = os.path.expandvars(local_path.strip().strip('"\''))
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError(
+            "Local folder path must be an absolute path, for example "
+            r"C:\Users\ibrah\Desktop\taskflow111. "
+            f"Received relative path: {local_path}"
+        )
+
+    repo_path = candidate.resolve()
     if not repo_path.exists():
         raise ValueError(f"Local folder does not exist: {repo_path}")
     if not repo_path.is_dir():
