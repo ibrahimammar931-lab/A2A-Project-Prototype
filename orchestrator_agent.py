@@ -185,16 +185,26 @@ class ManualWorkflowController:
 
     @property
     def steps(self) -> list[dict[str, str]]:
-        return [
+        steps = [
             {"id": "jira", "name": "Jira"},
-            {"id": "repo-initial", "name": "Repository"},
-            {"id": "knowledge", "name": "Knowledge"},
-            {"id": "planner", "name": "Planner"},
-            {"id": "developer", "name": "Developer"},
-            {"id": "reviewer", "name": "Reviewer"},
-            {"id": "developer-improve", "name": "Developer"},
-            {"id": "repo-final", "name": "Repository"},
         ]
+        if self._auto_model_selection_enabled():
+            steps.append({"id": "model-selector", "name": "Model Selector"})
+        steps.extend(
+            [
+                {"id": "repo-initial", "name": "Repository"},
+                {"id": "knowledge", "name": "Knowledge"},
+                {"id": "planner", "name": "Planner"},
+                {"id": "developer", "name": "Developer"},
+                {"id": "reviewer", "name": "Reviewer"},
+                {"id": "developer-improve", "name": "Developer"},
+                {"id": "repo-final", "name": "Repository"},
+            ]
+        )
+        return steps
+
+    def _auto_model_selection_enabled(self) -> bool:
+        return bool(globals().get("auto_model_selection", False))
 
     def _agent_id_for_step(self, step_id: str) -> str:
         # Steps that represent a re-run of an existing agent card map back to
@@ -216,6 +226,8 @@ class ManualWorkflowController:
             ("reviewer", "Reviewer"),
             ("repo-final", "Repo"),
         ]
+        if self._auto_model_selection_enabled():
+            definitions.insert(2, ("model-selector", "Model Selector"))
         return {
             agent_id: {
                 "id": agent_id,
@@ -316,8 +328,8 @@ class ManualWorkflowController:
         self.started_at = time.time()
         self.step_index = 0
         self.previous_agent = "None"
-        self.current_agent = "Jira"
-        self.next_agent = "Repository"
+        self.current_agent = self.steps[0]["name"]
+        self.next_agent = self.steps[1]["name"] if len(self.steps) > 1 else "None"
         self.context = {}
         self.agents = self._initial_agents()
         self.messages = []
@@ -326,6 +338,29 @@ class ManualWorkflowController:
 
     def _is_local_mode(self) -> bool:
         return self.workspace_mode == "local"
+
+    def _ensure_dynamic_agents(self) -> None:
+        if self._auto_model_selection_enabled() and "model-selector" not in self.agents:
+            self.agents["model-selector"] = self._new_agent("model-selector", "Model Selector")
+
+    def _new_agent(self, agent_id: str, name: str) -> dict[str, Any]:
+        return {
+            "id": agent_id,
+            "name": name,
+            "status": "waiting",
+            "executionState": "Waiting",
+            "startTime": None,
+            "endTime": None,
+            "duration": "00:00:00",
+            "currentAction": "Waiting",
+            "executionCount": 0,
+            "lastExecution": "Never",
+            "messagesSent": 0,
+            "messagesReceived": 0,
+            "files": {"read": [], "modified": [], "created": []},
+            "output": {},
+            "errors": [],
+        }
 
     def request_stop(self, reason: str) -> None:
         """Interrupts whatever step is currently executing, if any, and marks
@@ -347,6 +382,7 @@ class ManualWorkflowController:
             return
 
         step = self.steps[self.step_index]
+        self._ensure_dynamic_agents()
         agent_id = self._agent_id_for_step(step["id"])
         agent = self.agents[agent_id]
         self.status = "running"
@@ -476,6 +512,21 @@ class ManualWorkflowController:
         }
         self._add_message("Orchestrator", "Repo", "repo.prepared", repo.model_dump(), "delivered")
         self._add_message("Orchestrator", "Repo", "repo.branch_created", branch.model_dump(), "delivered")
+
+    async def _run_model_selector(self) -> None:
+        result = await _run_model_selection()
+        self.agents["model-selector"]["output"] = result or {
+            "selection": {key: current_model_selection.get(key) for key in AGENT_KEYS},
+            "skipped": True,
+            "reason": "Model selector did not return an updated selection.",
+        }
+        self._add_message(
+            "Model Selector",
+            "Orchestrator",
+            "models.selected",
+            self.agents["model-selector"]["output"],
+            "delivered",
+        )
 
     async def _run_knowledge(self) -> None:
         repo: RepoInfo = self.context["repo"]
@@ -832,9 +883,21 @@ class ManualWorkflowController:
         await self.run_next()
 
     def snapshot(self) -> dict[str, Any]:
+        self._ensure_dynamic_agents()
         elapsed = self._duration(self.started_at) if self.started_at else "00:00:00"
         repo = self.context.get("repo")
         branch = self.context.get("branch")
+        steps = self.steps
+        previous_step = steps[self.step_index - 1] if 0 <= self.step_index - 1 < len(steps) else None
+        current_step = steps[self.step_index] if 0 <= self.step_index < len(steps) else None
+        next_step = steps[self.step_index + 1] if 0 <= self.step_index + 1 < len(steps) else None
+        ordered_agent_ids = [self._agent_id_for_step(step["id"]) for step in self.steps]
+        ordered_agent_ids = ["orchestrator", *ordered_agent_ids]
+        ordered_agents = [
+            self.agents[agent_id]
+            for agent_id in dict.fromkeys(ordered_agent_ids)
+            if agent_id in self.agents
+        ]
         return {
             "summary": {
                 "status": self._dashboard_status(),
@@ -850,10 +913,21 @@ class ManualWorkflowController:
                 "previousAgent": self.previous_agent,
                 "currentAgent": self.current_agent,
                 "nextAgent": self.next_agent,
+                "previousStepId": previous_step["id"] if previous_step else None,
+                "currentStepId": current_step["id"] if current_step else None,
+                "nextStepId": next_step["id"] if next_step else None,
             },
-            "agents": list(self.agents.values()),
+            "agents": ordered_agents,
             "messages": self.messages,
             "activePath": ["orchestrator", *self.active_path],
+            "workflowSteps": [
+                {
+                    "id": step["id"],
+                    "agentId": self._agent_id_for_step(step["id"]),
+                    "name": step["name"],
+                }
+                for step in steps
+            ],
         }
 
     async def broadcast(self) -> None:
@@ -1095,7 +1169,7 @@ async def _check_model_health(model_id: str) -> bool:
         return False
 
 
-async def _run_model_selection() -> None:
+async def _run_model_selection() -> dict[str, Any] | None:
     """Call the Model Selector agent and persist its returned assignments.
 
     Only ever overwrites the 4 agent keys (knowledge, planner, developer,
@@ -1126,7 +1200,7 @@ async def _run_model_selection() -> None:
 
     if not all_candidates:
         logger.warning("No credentialed models available — skipping model selection")
-        return
+        return None
 
     # ---- Health-check every candidate; only keep the healthy ones -------
     manual_workflow.current_action = "Health-checking candidate models..."
@@ -1145,7 +1219,7 @@ async def _run_model_selection() -> None:
 
     if not healthy_candidates:
         logger.warning("All candidate models failed health checks — skipping model selection")
-        return
+        return None
 
     if unhealthy:
         logger.info(
@@ -1173,7 +1247,7 @@ async def _run_model_selection() -> None:
             response.raise_for_status()
         except Exception:
             logger.exception("Model selector call failed — keeping current selection")
-            return
+            return None
 
     result = response.json()
     selection: dict[str, str] = result.get("selection") or {}
@@ -1197,6 +1271,12 @@ async def _run_model_selection() -> None:
         {k: updated.get(k) for k in AGENT_KEYS},
         result.get("selector_model_used"),
     )
+    return {
+        **result,
+        "selection": {key: updated.get(key) for key in AGENT_KEYS},
+        "unhealthy_candidates": unhealthy,
+        "healthy_candidate_count": len(healthy_candidates),
+    }
 
 
 async def _run_automatic_workflow() -> None:
@@ -1223,12 +1303,6 @@ async def _run_automatic_workflow() -> None:
             await manual_workflow.broadcast()
             return
         manual_workflow.status = "running"
-
-    # Model selection right after Jira (ticket context is now populated)
-    if auto_model_selection:
-        manual_workflow.current_action = "Running model selection..."
-        await manual_workflow.broadcast()
-        await _run_model_selection()
 
     # Run remaining steps
     while manual_workflow.status not in {"failed", "completed"} and manual_workflow.step_index < len(manual_workflow.steps):
@@ -1445,6 +1519,8 @@ async def workflow_set_auto_model_selection(
             detail="'enabled' must be a boolean",
         )
     auto_model_selection = enabled
+    manual_workflow._ensure_dynamic_agents()
+    await manual_workflow.broadcast()
     return {
         "command": "set-auto-model-selection",
         "accepted": True,

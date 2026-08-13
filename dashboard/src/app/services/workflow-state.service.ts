@@ -1,7 +1,7 @@
 import { HttpClient } from '@angular/common/http';
 import { Injectable, computed, effect, inject, signal } from '@angular/core';
 import { Observable, Subject, catchError, interval, of, startWith, switchMap, tap } from 'rxjs';
-import { AgentMessage, AgentNode, WorkflowCommandResult, WorkflowSnapshot, WorkflowMode, WorkspaceMode } from '../models/workflow.models';
+import { AgentMessage, AgentNode, WorkflowCommandResult, WorkflowSnapshot, WorkflowMode, WorkflowStep, WorkspaceMode } from '../models/workflow.models';
 
 const API_BASE = '/api/workflow';
 const WS_URL = 'ws://localhost:8010/ws/workflow';
@@ -19,6 +19,12 @@ export class WorkflowStateService {
   readonly agents = computed(() => this.snapshot().agents);
   readonly messages = computed(() => this.snapshot().messages);
   readonly activePath = computed(() => this.snapshot().activePath);
+  readonly workflowSteps = computed(() => {
+    const snapshot = this.snapshot();
+    return snapshot.workflowSteps?.length
+      ? snapshot.workflowSteps
+      : fallbackWorkflowSteps(snapshot.agents);
+  });
   readonly availableModels = signal<{ id: string; label: string; provider: string }[]>([]);
   readonly modelSelection = signal<Record<string, string>>({});
   readonly currentMode = signal<WorkflowMode>('manual');
@@ -188,7 +194,7 @@ export class WorkflowStateService {
 
   runNextAgent(): void {
     this.command('run-next-agent');
-    this.patchSummary({ status: 'running', runningAgent: this.summary().nextAgent, currentAction: `Running ${this.summary().nextAgent}` });
+    this.patchSummary({ status: 'running', runningAgent: this.summary().currentAgent, currentAction: `Running ${this.summary().currentAgent}` });
   }
 
   rerunCurrentAgent(): void {
@@ -382,6 +388,18 @@ function createMockSnapshot(): WorkflowSnapshot {
     ],
     activePath: ['jira', 'orchestrator', 'repo-initial', 'knowledge', 'planner', 'developer']
   };
+}
+
+function fallbackWorkflowSteps(agents: AgentNode[]): WorkflowStep[] {
+  const preferredOrder = ['jira', 'model-selector', 'repo-initial', 'knowledge', 'planner', 'developer', 'reviewer', 'repo-final'];
+  const byId = new Map(agents.map((agent) => [agent.id, agent]));
+  return preferredOrder
+    .filter((agentId) => byId.has(agentId))
+    .map((agentId) => ({
+      id: agentId,
+      agentId,
+      name: byId.get(agentId)?.name === 'Repo' ? 'Repository' : byId.get(agentId)?.name ?? agentId
+    }));
 }
 
 function agent(

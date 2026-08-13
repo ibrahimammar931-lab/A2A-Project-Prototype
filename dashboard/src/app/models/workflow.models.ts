@@ -18,6 +18,9 @@ export interface WorkflowSummary {
   previousAgent: string;
   currentAgent: string;
   nextAgent: string;
+  previousStepId?: string | null;
+  currentStepId?: string | null;
+  nextStepId?: string | null;
 }
 
 export interface AgentFileActivity {
@@ -69,6 +72,13 @@ export interface WorkflowSnapshot {
   agents: AgentNode[];
   messages: AgentMessage[];
   activePath: string[];
+  workflowSteps?: WorkflowStep[];
+}
+
+export interface WorkflowStep {
+  id: string;
+  agentId: string;
+  name: string;
 }
 
 export interface WorkflowCommandResult {

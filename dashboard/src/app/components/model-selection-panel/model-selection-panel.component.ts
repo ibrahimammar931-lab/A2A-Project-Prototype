@@ -1,4 +1,4 @@
-import { Component, computed, inject, OnInit } from '@angular/core';
+import { Component, computed, effect, inject, OnInit } from '@angular/core';
 import { UpperCasePipe } from '@angular/common';
 import { MatCardModule } from '@angular/material/card';
 import { MatSelectModule } from '@angular/material/select';
@@ -48,7 +48,7 @@ const AGENT_LABELS: Record<string, string> = {
               <mat-select
                 [(ngModel)]="selections[agentKey]"
                 placeholder="Auto-selected"
-                [disabled]="workflow.autoModelSelection()"
+                [disabled]="workflow.autoModelSelection() && agentKey !== 'model_selector'"
               >
                 <mat-option [value]="''">
                   Auto-selected
@@ -64,7 +64,7 @@ const AGENT_LABELS: Record<string, string> = {
         }
       </mat-card-content>
       <mat-card-actions align="end">
-        <button mat-flat-button color="primary" (click)="save()" [disabled]="workflow.autoModelSelection()">
+        <button mat-flat-button color="primary" (click)="save()">
           <mat-icon>save</mat-icon>
           Save Selection
         </button>
@@ -128,6 +128,15 @@ export class ModelSelectionPanelComponent implements OnInit {
   /** Models from signal, reshaped to provider-prefixed labels. */
   readonly groupedModels = () => this.workflow.availableModels();
 
+  constructor() {
+    effect(() => {
+      const current = this.workflow.modelSelection();
+      for (const key of AGENT_DISPLAY_ORDER) {
+        this.selections[key] = current[key] ?? '';
+      }
+    });
+  }
+
   ngOnInit(): void {
     this.workflow.loadAvailableModels();
     this.workflow.loadModelSelection();
@@ -135,10 +144,6 @@ export class ModelSelectionPanelComponent implements OnInit {
     // HTTP call inside loadModelSelection() sets the signal when it
     // completes, so on any subsequent init (e.g. route re-activation)
     // the signal already carries the latest persisted state.
-    const current = this.workflow.modelSelection();
-    for (const key of AGENT_DISPLAY_ORDER) {
-      this.selections[key] = current[key] ?? '';
-    }
   }
 
   save(): void {

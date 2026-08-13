@@ -17,10 +17,10 @@ import { WorkflowStateService } from '../../services/workflow-state.service';
       </div>
 
       <div class="chain">
-        @for (agent of agents(); track agent.name; let index = $index) {
+        @for (step of steps(); track step.id; let index = $index) {
           <span [class.done]="index < currentIndex()" [class.current]="index === currentIndex()">
             <mat-icon>{{ index < currentIndex() ? 'check_circle' : index === currentIndex() ? 'play_arrow' : 'radio_button_unchecked' }}</mat-icon>
-            {{ agent.name }}
+            {{ step.name }}
           </span>
         }
       </div>
@@ -114,17 +114,13 @@ import { WorkflowStateService } from '../../services/workflow-state.service';
 export class ApprovalPanelComponent {
   readonly workflow = inject(WorkflowStateService);
   readonly summary = this.workflow.summary;
-  readonly agents = () => [
-    { name: 'Jira' },
-    { name: 'Repository' },
-    { name: 'Knowledge' },
-    { name: 'Planner' },
-    { name: 'Developer' },
-    { name: 'Reviewer' },
-    { name: 'Repository' }
-  ];
+  readonly steps = this.workflow.workflowSteps;
 
   currentIndex(): number {
-    return this.agents().findIndex((agent) => agent.name === this.summary().currentAgent);
+    const currentStepId = this.summary().currentStepId;
+    if (currentStepId) {
+      return this.steps().findIndex((step) => step.id === currentStepId);
+    }
+    return this.steps().findIndex((step) => step.name === this.summary().currentAgent);
   }
 }
