@@ -1,71 +1,96 @@
-# Simple A2A Microservices Prototype
+# A2A Agent Workflow Project
 
-This project is a small Agent-to-Agent microservices prototype built with FastAPI.
-It separates Jira retrieval, code generation, code review, and workflow orchestration
-into independent services that communicate over HTTP.
+This repository contains a FastAPI-based multi-agent workflow for taking a Jira issue, understanding the target repo, planning the work, generating code, reviewing it, and applying the change to a GitHub branch. It also includes an Angular dashboard for monitoring and manually controlling the workflow.
 
-- `jira_agent.py` fetches Jira tickets.
-- `knowledge_agent.py` maintains repository knowledge.
-- `planner_agent.py` produces implementation plans from tickets and knowledge.
-- `repo_agent.py` reads and updates GitHub repositories.
-- `reviewer_agent.py` reviews generated code.
-- `developer_agent.py` generates and improves code.
-- `orchestrator_agent.py` owns the full "work on this ticket" flow.
+## What is in this project
 
-## Services
+The current codebase includes these services:
 
-The current version has four services:
+- Jira Agent: reads Jira issues and normalizes them into shared schemas
+- Repo Agent: prepares local workspace clones and performs GitHub operations
+- Knowledge Agent: builds and updates repository knowledge summaries
+- Planner Agent: creates an implementation plan from a ticket and repo context
+- Developer Agent: generates and revises code changes
+- Reviewer Agent: reviews diffs and flags blocking issues
+- Model Selector Agent: checks candidate models and picks best model per role
+- Orchestrator Agent: coordinates the full workflow and exposes the dashboard APIs
 
-```text
-Developer Agent    -> developer_agent.py    -> port 8000
-Jira Agent         -> jira_agent.py         -> port 8001
-Reviewer Agent     -> reviewer_agent.py     -> port 8002
-Orchestrator Agent -> orchestrator_agent.py -> port 8003
-```
-
-## Project Structure
+## Default service ports
 
 ```text
-.
-|-- developer_agent.py
-|-- reviewer_agent.py
-|-- jira_agent.py
-|-- knowledge_agent.py
-|-- planner_agent.py
-|-- repo_agent.py
-|-- orchestrator_agent.py
-|-- schemas.py
-|-- config.py
-|-- requirements.txt
-|-- .env.example
-|-- SETUP.md
-`-- README.md
+Developer Agent      -> developer_agent.py      -> 8000
+Jira Agent           -> jira_agent.py           -> 8001
+Reviewer Agent       -> reviewer_agent.py       -> 8002
+Orchestrator Agent    -> orchestrator_agent.py    -> 8003
+Repo Agent           -> repo_agent.py           -> 8004
+Knowledge Agent      -> knowledge_agent.py      -> 8005
+Planner Agent        -> planner_agent.py        -> 8006
+Model Selector Agent -> model_selector_agent.py -> 8007
 ```
 
-`developer_agent.py` contains the Developer Agent logic and its API.
+These service URLs are configurable through environment variables in [config.py](config.py), and the defaults are defined there.
 
-`reviewer_agent.py` contains the Reviewer Agent logic and its API.
+## Project structure
 
-`jira_agent.py` contains the Jira REST API logic and its API.
+```text
+A2A/
+├── .env.example
+├── .env
+├── README.md
+├── SETUP.md
+├── available_models.py
+├── config.py
+├── developer_agent.py
+├── jira_agent.py
+├── knowledge_agent.py
+├── model_selection.json
+├── model_selector_agent.py
+├── orchestrator_agent.py
+├── planner_agent.py
+├── repo_agent.py
+├── requirements.txt
+├── reviewer_agent.py
+├── schemas.py
+├── workspaces/
+│   ├── knowledge/
+│   └── ...
+├── dashboard/
+│   ├── angular.json
+│   ├── package.json
+│   └── src/
+├── A2A_Project_Documentation.md
+└── A2A_Workflow_Plan.pdf
+```
 
-`knowledge_agent.py` maintains structured repository knowledge.
+## Quick start
 
-`planner_agent.py` plans implementation work without generating code or editing files.
+1. Create a virtual environment.
 
-`repo_agent.py` reads selected files and applies GitHub API changes.
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
 
-`orchestrator_agent.py` contains the cross-agent workflow API.
-
-## Installation
+On macOS/Linux:
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+2. Install Python dependencies.
+
+```bash
 pip install -r requirements.txt
+```
+
+3. Copy the example environment file and fill in your own values.
+
+```bash
 copy .env.example .env
 ```
 
-Edit `.env`:
+The example file contains the current required keys and optional overrides used by the code. The important values are:
 
 ```env
 GROQ_API_KEY=your_groq_api_key_here
@@ -73,6 +98,9 @@ GROQ_MODEL=llama-3.3-70b-versatile
 GROQ_REVIEWER_MODEL=llama-3.3-70b-versatile
 GROQ_PLANNER_MODEL=llama-3.3-70b-versatile
 LOG_LEVEL=INFO
+
+ANTHROPIC_API_KEY=your_anthropic_api_key_here
+OPENAI_API_KEY=your_openai_api_key_here
 
 JIRA_BASE_URL=https://your-domain.atlassian.net
 JIRA_EMAIL=your_email@example.com
@@ -84,11 +112,17 @@ REVIEWER_SERVICE_URL=http://127.0.0.1:8002
 REPO_SERVICE_URL=http://127.0.0.1:8004
 KNOWLEDGE_SERVICE_URL=http://127.0.0.1:8005
 PLANNER_SERVICE_URL=http://127.0.0.1:8006
+MODEL_SELECTOR_SERVICE_URL=http://127.0.0.1:8007
+
+GITHUB_REPO_URL=https://github.com/owner/project.git
+GITHUB_TOKEN=your_github_token_here
+REPO_WORKSPACE_ROOT=workspaces
+LOCAL_KNOWLEDGE_ROOT=workspaces/knowledge
 ```
 
-## Run The Services
+## Run the services
 
-Open seven terminals.
+Open separate terminals and start each service.
 
 Terminal 1:
 
@@ -111,153 +145,124 @@ uvicorn developer_agent:app --port 8000 --reload
 Terminal 4:
 
 ```bash
-uvicorn orchestrator_agent:app --port 8003 --reload
+uvicorn repo_agent:app --port 8004 --reload
 ```
 
 Terminal 5:
 
 ```bash
-uvicorn repo_agent:app --port 8004 --reload
+uvicorn knowledge_agent:app --port 8005 --reload
 ```
 
 Terminal 6:
 
 ```bash
-uvicorn knowledge_agent:app --port 8005 --reload
+uvicorn planner_agent:app --port 8006 --reload
 ```
 
 Terminal 7:
 
 ```bash
-uvicorn planner_agent:app --port 8006 --reload
+uvicorn model_selector_agent:app --port 8007 --reload
 ```
 
-Developer service docs:
+Terminal 8:
+
+```bash
+uvicorn orchestrator_agent:app --port 8003 --reload
+```
+
+## FastAPI docs
+
+Once the services are running, the Swagger UI is available here:
 
 ```text
-http://127.0.0.1:8000/docs
+Developer Agent:      http://127.0.0.1:8000/docs
+Jira Agent:           http://127.0.0.1:8001/docs
+Reviewer Agent:       http://127.0.0.1:8002/docs
+Orchestrator Agent:    http://127.0.0.1:8003/docs
+Repo Agent:           http://127.0.0.1:8004/docs
+Knowledge Agent:      http://127.0.0.1:8005/docs
+Planner Agent:        http://127.0.0.1:8006/docs
+Model Selector Agent: http://127.0.0.1:8007/docs
 ```
 
-Orchestrator service docs:
+## Dashboard
+
+The Angular dashboard lives in the [dashboard](dashboard) folder. It is built for visualizing the workflow and manually starting the orchestrator pipeline.
+
+From the project root:
+
+```bash
+cd dashboard
+npm install
+npm start
+```
+
+Then open:
 
 ```text
-http://127.0.0.1:8003/docs
+http://localhost:4200
 ```
 
-Reviewer service docs:
+The dashboard talks to the orchestrator through endpoints under `/api/workflow/*`.
 
-```text
-Client
-  -> Orchestrator Agent
-    -> Jira Agent
-    -> Developer Agent
-    -> Reviewer Agent
-    -> Developer Agent
-```
+## Workflow model
 
-The services exchange shared Pydantic models from `schemas.py`.
+The current orchestrator flow is driven by the dashboard and agent APIs, not by an old `/work-on-ticket` endpoint. The active orchestration endpoints include:
 
-Planner service docs:
+- `GET /api/workflow/state`
+- `POST /api/workflow/start`
+- `POST /api/workflow/run-next-agent`
+- `POST /api/workflow/set-mode`
+- `POST /api/workflow/model-selection`
+- `POST /api/workflow/set-auto-model-selection`
 
-```text
-http://127.0.0.1:8006/docs
-```
+The workflow normally performs these steps:
 
-## Main Workflow
+1. Fetch Jira ticket
+2. Prepare repo workspace
+3. Ensure knowledge exists for the repo
+4. Plan the work
+5. Create or select a branch
+6. Read likely files
+7. Generate code
+8. Review code
+9. Improve code if needed
+10. Apply changes and update repo knowledge
+11. Open a PR if configured
 
-Call the Orchestrator service:
+## Model selection
 
-```text
-POST http://127.0.0.1:8003/work-on-ticket
-```
+The project can dynamically choose a model for each role using the Model Selector Agent and the `AVAILABLE_MODELS` registry in [available_models.py](available_models.py). The selector is configured through [model_selection.json](model_selection.json) and any per-agent override is also exposed via the dashboard.
 
-Request:
+## Notes
 
-```json
-{
-  "issue_key": "PROJ-123",
-  "base_branch": "main"
-}
-```
+- The repo uses `.env` values loaded by [config.py](config.py).
+- JIRA credential checks and model-provider checks are enforced at runtime.
+- GitHub operations require a valid `GITHUB_TOKEN` and a target repo URL.
+- The repo workspace defaults to `workspaces/` and the knowledge cache defaults to `workspaces/knowledge`.
 
-The Orchestrator uses `GITHUB_REPO_URL` from `.env`. The Planner Agent chooses which existing files to read from the knowledge base and which new files should be created.
+## For local development
 
-PowerShell example:
+If you only want to validate the Python files without running the full workflow, use:
 
 ```powershell
-Invoke-RestMethod `
-  -Uri "http://127.0.0.1:8003/work-on-ticket" `
-  -Method Post `
-  -ContentType "application/json" `
-  -Body '{"issue_key":"PROJ-123","base_branch":"main"}'
+.\.venv\Scripts\python.exe -m py_compile `
+  config.py `
+  schemas.py `
+  jira_agent.py `
+  developer_agent.py `
+  reviewer_agent.py `
+  repo_agent.py `
+  knowledge_agent.py `
+  planner_agent.py `
+  model_selector_agent.py `
+  orchestrator_agent.py
 ```
 
-## Service APIs
+This project is a prototype and is designed to be run locally while connected to Jira, Groq/OpenAI-compatible providers, and GitHub credentials.
 
-### Orchestrator Agent
-
-```text
-POST /work-on-ticket
-```
-
-Coordinates the full Jira-to-code workflow.
-
-### Jira Agent
-
-```text
-GET /tickets/{issue_key}
-```
-
-Fetches a Jira issue through Jira REST API and returns a normalized `JiraTicket`.
-
-### Developer Agent
-
-```text
-POST /generate
-POST /improve
-```
-
-`/generate` creates initial code from a task.
-
-`/improve` revises code using reviewer feedback.
-
-### Reviewer Agent
-
-```text
-POST /review
-```
-
-`/work-on-ticket` is the complete flow:
-
-```text
-Orchestrator Service receives issue key
-  -> calls Jira Service
-  -> converts ticket into a task prompt
-  -> asks Repo Service to prepare the repo
-  -> asks Knowledge Agent to ensure repository knowledge exists
-  -> asks Planner Agent to produce a structured plan
-  -> asks Repo Service to read Planner likely_existing_files
-  -> calls Developer Service to generate original code
-  -> calls Reviewer Service
-  -> calls Developer Service to improve the code
-  -> returns ticket, original code, review feedback, improved code, and messages
-```
-
-The Planner Agent never calls the Repository Agent or Developer Agent directly. Only the Orchestrator coordinates those calls.
-
-Repo Service:
-
-```text
-POST /prepare-repo
-POST /create-branch
-POST /read-files
-POST /apply-changes
-POST /open-pr
-```
-
-The Repo service owns repository operations. It uses the local clone for reading files, and GitHub API for creating ticket branches, applying structured file changes, committing changes, and opening pull requests.
-
-Prepare the configured repo:
 
 ```powershell
 Invoke-RestMethod `
