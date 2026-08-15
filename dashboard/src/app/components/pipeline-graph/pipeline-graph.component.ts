@@ -2,6 +2,7 @@ import { AfterViewInit, Component, ElementRef, OnDestroy, ViewChild, effect, inj
 import { MatButtonModule } from '@angular/material/button';
 import { MatIconModule } from '@angular/material/icon';
 import cytoscape, { Core, ElementDefinition } from 'cytoscape';
+import { AgentNode } from '../../models/workflow.models';
 import { WorkflowStateService } from '../../services/workflow-state.service';
 
 @Component({
@@ -121,14 +122,27 @@ export class PipelineGraphComponent implements AfterViewInit, OnDestroy {
   private readonly workflow = inject(WorkflowStateService);
   private cy?: Core;
   private resizeObserver?: ResizeObserver;
+  private elementSignature = '';
 
   constructor() {
     effect(() => {
       const agents = this.workflow.agents();
       const activePath = this.workflow.activePath();
       const selectedAgentId = this.workflow.selectedAgentId();
+      const workflowSteps = this.workflow.workflowSteps();
       if (!this.cy) {
         return;
+      }
+
+      const nextSignature = JSON.stringify({
+        agents: agents.map((agent) => agent.id),
+        steps: workflowSteps.map((step) => `${step.id}:${step.agentId}`)
+      });
+      if (nextSignature !== this.elementSignature) {
+        this.elementSignature = nextSignature;
+        this.cy.elements().remove();
+        this.cy.add(this.elements());
+        this.cy.layout({ name: 'preset', fit: true, padding: 60 }).run();
       }
 
       this.cy.batch(() => {
@@ -203,6 +217,16 @@ export class PipelineGraphComponent implements AfterViewInit, OnDestroy {
           }
         },
         {
+          selector: 'edge.orchestrator-link',
+          style: {
+            'line-color': 'rgba(103, 232, 249, 0.22)',
+            'target-arrow-color': 'rgba(103, 232, 249, 0.34)',
+            'line-style': 'dashed',
+            width: 2,
+            'z-index': 1
+          }
+        },
+        {
           selector: 'edge.active-path',
           style: {
             'line-color': '#67e8f9',
@@ -271,18 +295,16 @@ export class PipelineGraphComponent implements AfterViewInit, OnDestroy {
   }
 
   private elements(): ElementDefinition[] {
-    const positions: Record<string, { x: number; y: number }> = {
-      jira: { x: 120, y: 80 },
-      orchestrator: { x: 120, y: 230 },
-      'repo-initial': { x: -190, y: 430 },
-      knowledge: { x: 0, y: 430 },
-      planner: { x: 190, y: 430 },
-      developer: { x: 380, y: 430 },
-      reviewer: { x: 570, y: 430 },
-      'repo-final': { x: 760, y: 430 }
-    };
+    const steps = this.workflow.workflowSteps();
+    const route = ['orchestrator', ...steps.map((step) => step.agentId)];
+    const uniqueRoute = Array.from(new Set(route));
+    const positions = this.positionRoute(uniqueRoute);
+    const agentsById = new Map(this.workflow.agents().map((agent) => [agent.id, agent]));
 
-    const nodes = this.workflow.agents().map((agent) => ({
+    const nodes = uniqueRoute
+      .map((agentId) => agentsById.get(agentId))
+      .filter((agent): agent is AgentNode => Boolean(agent))
+      .map((agent) => ({
       group: 'nodes' as const,
       data: {
         id: agent.id,
@@ -294,25 +316,40 @@ export class PipelineGraphComponent implements AfterViewInit, OnDestroy {
       position: positions[agent.id]
     }));
 
-    const edges = [
-      ['jira', 'orchestrator'],
-      ['orchestrator', 'repo-initial'],
-      ['orchestrator', 'knowledge'],
-      ['orchestrator', 'planner'],
-      ['orchestrator', 'developer'],
-      ['orchestrator', 'reviewer'],
-      ['orchestrator', 'repo-final'],
-      ['repo-initial', 'knowledge'],
-      ['knowledge', 'planner'],
-      ['planner', 'developer'],
-      ['developer', 'reviewer'],
-      ['reviewer', 'repo-final']
-    ].map(([source, target]) => ({
+    const workflowEdges = route
+      .slice(0, -1)
+      .map((source, index) => [source, route[index + 1]])
+      .filter(([source, target]) => source !== target)
+      .map(([source, target]) => ({
       group: 'edges' as const,
       data: { id: `${source}-${target}`, source, target }
     }));
+    const workflowEdgeIds = new Set(workflowEdges.map((edge) => edge.data.id));
 
-    return [...nodes, ...edges];
+    const orchestratorEdges = uniqueRoute
+      .filter((agentId) => agentId !== 'orchestrator')
+      .map((agentId) => ({
+        group: 'edges' as const,
+        data: { id: `orchestrator-${agentId}`, source: 'orchestrator', target: agentId },
+        classes: 'orchestrator-link'
+      }))
+      .filter((edge) => !workflowEdgeIds.has(edge.data.id));
+
+    return [...nodes, ...orchestratorEdges, ...workflowEdges];
+  }
+
+  private positionRoute(route: string[]): Record<string, { x: number; y: number }> {
+    const positions: Record<string, { x: number; y: number }> = {};
+    const topY = 95;
+    const flowY = 330;
+    const spacing = 205;
+    const startX = 120;
+    route.forEach((agentId, index) => {
+      positions[agentId] = index === 0
+        ? { x: startX + Math.max(route.length - 2, 0) * spacing / 2, y: topY }
+        : { x: startX + (index - 1) * spacing, y: flowY };
+    });
+    return positions;
   }
 
   private prettyStatus(status: string): string {

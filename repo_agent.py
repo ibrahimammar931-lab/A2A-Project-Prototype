@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import subprocess
 from base64 import b64encode
@@ -260,6 +261,33 @@ def existing_repo_path(repo_id: str) -> Path:
     return repo_path
 
 
+def local_repo_path(local_path: str | None) -> Path:
+    if not local_path or not local_path.strip():
+        raise ValueError("Missing local_path for local folder mode.")
+
+    raw_path = os.path.expandvars(local_path.strip().strip('"\''))
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError(
+            "Local folder path must be an absolute path, for example "
+            r"C:\Users\ibrah\Desktop\taskflow111. "
+            f"Received relative path: {local_path}"
+        )
+
+    repo_path = candidate.resolve()
+    if not repo_path.exists():
+        raise ValueError(f"Local folder does not exist: {repo_path}")
+    if not repo_path.is_dir():
+        raise ValueError(f"Local path is not a folder: {repo_path}")
+    if not (repo_path / ".git").exists():
+        raise ValueError(f"Local folder must be a git repository: {repo_path}")
+    return repo_path
+
+
+def local_repo_id(repo_path: Path) -> str:
+    return slugify(f"local-{repo_path.name}")
+
+
 def safe_repo_file(repo_path: Path, relative_path: str) -> Path:
     if Path(relative_path).is_absolute():
         raise ValueError(f"Absolute paths are not allowed: {relative_path}")
@@ -307,6 +335,33 @@ def unique_branch_name(repo_path: Path, branch: str) -> str:
 
 
 def checkout_branch(repo_path: Path, branch: str) -> None:
+    """Check out *branch* and guarantee the working tree matches origin.
+
+    IMPORTANT: changes in this project are applied via the GitHub Contents
+    API (see apply_changes / github_put_file_with_retry below), not local
+    `git commit` + `git push`. That means commits can land on a branch on
+    GitHub's side with the local clone never having pulled them down — a
+    plain `git checkout <branch>` only switches which local ref is active,
+    it does NOT fast-forward that ref to match origin's latest commit. A
+    stale local branch then makes downstream reads (e.g. /read-files) fail
+    with "File does not exist" for a file that genuinely exists in the
+    repo's real history, simply because it was never pulled into this
+    particular working tree.
+
+    To fix this at the root rather than patching every read path
+    individually, this function always ends with a hard reset to
+    origin/<branch> after checkout, so the working tree is guaranteed to
+    reflect the branch's true remote state every time it's checked out —
+    regardless of whether this is the first checkout, a re-checkout of an
+    existing local branch, or a branch that's had commits land via the
+    GitHub API since the last time this local clone touched it.
+
+    This discards any local-only, uncommitted changes on that branch. That
+    is intentional and safe for this project: nothing in this codebase
+    writes directly to the working tree and relies on those writes
+    surviving un-pushed — all real changes go through the GitHub Contents
+    API, which means the remote is always the source of truth.
+    """
     run_git(repo_path, ["fetch", "origin", "--prune"])
     try:
         run_git(repo_path, ["fetch", "origin", branch])
@@ -317,6 +372,23 @@ def checkout_branch(repo_path: Path, branch: str) -> None:
         run_git(repo_path, ["checkout", branch])
     else:
         run_git(repo_path, ["checkout", "-b", branch, f"origin/{branch}"])
+
+    # Hard-reset to match the remote exactly. If origin/<branch> isn't
+    # resolvable (e.g. a brand-new branch that hasn't been pushed at all
+    # yet), skip the reset rather than failing — the freshly created local
+    # branch is already correct in that case, there's simply nothing on
+    # the remote yet to reset against.
+    try:
+        run_git(repo_path, ["rev-parse", "--verify", f"refs/remotes/origin/{branch}"])
+    except RuntimeError:
+        logger.debug(
+            "origin/%s not resolvable yet (branch not pushed?) — skipping hard reset",
+            branch,
+        )
+        return
+
+    run_git(repo_path, ["reset", "--hard", f"origin/{branch}"])
+    logger.info("Working tree for %s hard-reset to origin/%s", repo_path, branch)
 
 
 def build_commit_message(issue_key: str, summary: str, body: str | None) -> str:
@@ -383,6 +455,20 @@ def normalize_change_action(action: str) -> str:
 @app.post("/prepare-repo", response_model=RepoInfo)
 def prepare_repo(request: PrepareRepoRequest) -> RepoInfo:
     try:
+        if request.workspace_mode == "local":
+            repo_path = local_repo_path(request.local_path)
+            try:
+                remote_url = run_git(repo_path, ["remote", "get-url", "origin"])
+            except RuntimeError:
+                remote_url = str(repo_path)
+            return RepoInfo(
+                repo_id=local_repo_id(repo_path),
+                path=str(repo_path),
+                current_branch=current_branch(repo_path),
+                remote_url=remote_url,
+                status="local",
+            )
+
         repo_url = request.repo_url or GITHUB_REPO_URL
         if not repo_url:
             raise ValueError(
@@ -467,14 +553,31 @@ def create_branch(request: CreateBranchRequest) -> BranchResponse:
 @app.post("/read-files", response_model=ReadFilesResponse)
 def read_files(request: ReadFilesRequest) -> ReadFilesResponse:
     try:
-        repo_id = repo_id_from_url(request.repo_url)
-        repo_path = existing_repo_path(repo_id)
-        files = []
+        if request.workspace_mode == "local":
+            repo_path = local_repo_path(request.local_path or request.repo_url)
+            repo_id = local_repo_id(repo_path)
+        else:
+            repo_id = repo_id_from_url(request.repo_url)
+            repo_path = existing_repo_path(repo_id)
 
+        # FIX: previously this read directly from whatever happened to be
+        # checked out, with no branch awareness and no guarantee the
+        # working tree was up to date with the remote. Changes applied via
+        # the GitHub Contents API never touch the local working tree, so a
+        # file that was genuinely created/committed moments ago could be
+        # completely absent on disk here. If a branch was specified,
+        # explicitly check it out (which now also hard-resets to
+        # origin/<branch> — see checkout_branch) before reading, so the
+        # working tree is guaranteed current before any file is read.
+        if request.workspace_mode != "local" and request.branch:
+            checkout_branch(repo_path, request.branch)
+
+        files = []
         for path in request.paths:
             file_path = safe_repo_file(repo_path, path)
             if not file_path.is_file():
-                raise ValueError(f"File does not exist: {path}")
+                branch_note = f" on branch '{request.branch}'" if request.branch else ""
+                raise ValueError(f"File does not exist{branch_note}: {path}")
             files.append(RepoFile(path=path, content=file_path.read_text(encoding="utf-8")))
 
         return ReadFilesResponse(repo_id=repo_id, files=files)
@@ -492,6 +595,31 @@ def read_files(request: ReadFilesRequest) -> ReadFilesResponse:
 @app.post("/apply-changes", response_model=ApplyChangesResponse)
 def apply_changes(request: ApplyChangesRequest) -> ApplyChangesResponse:
     try:
+        if request.workspace_mode == "local":
+            repo_path = local_repo_path(request.local_path or request.repo_url)
+            changed_files = []
+            for change in request.changes:
+                action = normalize_change_action(change.action)
+                file_path = safe_repo_file(repo_path, change.path)
+                if action in {"create", "update", "upsert"}:
+                    if change.content is None:
+                        raise ValueError(f"Missing content for {change.path}")
+                    file_path.parent.mkdir(parents=True, exist_ok=True)
+                    file_path.write_text(change.content, encoding="utf-8")
+                elif action == "delete":
+                    if file_path.exists():
+                        file_path.unlink()
+                else:
+                    raise ValueError(f"Unsupported change action: {change.action}")
+                changed_files.append(change.path)
+
+            return ApplyChangesResponse(
+                repo_id=local_repo_id(repo_path),
+                changed_files=changed_files,
+                branch=current_branch(repo_path) or request.branch or "local",
+                commit_shas=[],
+            )
+
         repo_id = repo_id_from_url(request.repo_url)
         owner, repo = github_owner_repo(request.repo_url)
         branch = request.branch
@@ -557,8 +685,12 @@ def apply_changes(request: ApplyChangesRequest) -> ApplyChangesResponse:
 @app.post("/diff", response_model=RepoDiffResponse)
 def diff(request: RepoDiffRequest) -> RepoDiffResponse:
     try:
-        repo_id = repo_id_from_url(request.repo_url)
-        repo_path = existing_repo_path(repo_id)
+        if request.workspace_mode == "local":
+            repo_path = local_repo_path(request.local_path or request.repo_url)
+            repo_id = local_repo_id(repo_path)
+        else:
+            repo_id = repo_id_from_url(request.repo_url)
+            repo_path = existing_repo_path(repo_id)
         repo_diff = run_git(repo_path, ["diff", "--", "."])
         return RepoDiffResponse(repo_id=repo_id, diff=repo_diff)
     except Exception as exc:

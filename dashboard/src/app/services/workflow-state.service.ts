@@ -1,7 +1,7 @@
 import { HttpClient } from '@angular/common/http';
 import { Injectable, computed, effect, inject, signal } from '@angular/core';
 import { Observable, Subject, catchError, interval, of, startWith, switchMap, tap } from 'rxjs';
-import { AgentMessage, AgentNode, WorkflowCommandResult, WorkflowSnapshot, WorkflowMode } from '../models/workflow.models';
+import { AgentMessage, AgentNode, WorkflowCommandResult, WorkflowSnapshot, WorkflowMode, WorkflowStep, WorkspaceMode } from '../models/workflow.models';
 
 const API_BASE = '/api/workflow';
 const WS_URL = 'ws://localhost:8010/ws/workflow';
@@ -19,9 +19,19 @@ export class WorkflowStateService {
   readonly agents = computed(() => this.snapshot().agents);
   readonly messages = computed(() => this.snapshot().messages);
   readonly activePath = computed(() => this.snapshot().activePath);
+  readonly workflowSteps = computed(() => {
+    const snapshot = this.snapshot();
+    return snapshot.workflowSteps?.length
+      ? snapshot.workflowSteps
+      : fallbackWorkflowSteps(snapshot.agents);
+  });
+  readonly availableModels = signal<{ id: string; label: string; provider: string }[]>([]);
+  readonly modelSelection = signal<Record<string, string>>({});
   readonly currentMode = signal<WorkflowMode>('manual');
   readonly isManualMode = computed(() => this.currentMode() === 'manual');
   readonly isAutomaticMode = computed(() => this.currentMode() === 'automatic');
+  readonly autoModelSelection = signal<boolean>(false);
+  readonly isAutoModelMode = computed(() => this.autoModelSelection());
   readonly selectedAgent = computed(() => {
     const selectedId = this.selectedAgentId();
     return this.snapshot().agents.find((agent) => agent.id === selectedId) ?? null;
@@ -80,6 +90,40 @@ export class WorkflowStateService {
     });
   }
 
+  loadAvailableModels(): void {
+    this.http.get<{ id: string; label: string; provider: string }[]>(`${API_BASE}/available-models`).pipe(
+      catchError(() => of([]))
+    ).subscribe((models) => this.availableModels.set(models));
+  }
+
+  loadModelSelection(): void {
+    this.http.get<Record<string, string>>(`${API_BASE}/model-selection`).pipe(
+      catchError(() => of({}))
+    ).subscribe((selection) => this.modelSelection.set(selection));
+  }
+
+  saveModelSelection(selection: Partial<Record<string, string>>): void {
+    this.http.post<Record<string, string>>(`${API_BASE}/model-selection`, selection).pipe(
+      catchError(() => of(this.modelSelection()))
+    ).subscribe((updated) => this.modelSelection.set(updated));
+  }
+
+  fetchAutoModelSelection(): void {
+    this.http.get<{ enabled: boolean }>(`${API_BASE}/auto-model-selection`).pipe(
+      catchError(() => of({ enabled: false }))
+    ).subscribe((result) => {
+      this.autoModelSelection.set(result.enabled);
+    });
+  }
+
+  setAutoModelSelection(enabled: boolean): void {
+    this.http.post<{ enabled: boolean }>(`${API_BASE}/set-auto-model-selection`, { enabled }).pipe(
+      catchError(() => of({ enabled: this.autoModelSelection() }))
+    ).subscribe((result) => {
+      this.autoModelSelection.set(result.enabled);
+    });
+  }
+
   toggleMode(): void {
     const newMode: WorkflowMode = this.currentMode() === 'manual' ? 'automatic' : 'manual';
     this.setMode(newMode);
@@ -90,14 +134,18 @@ export class WorkflowStateService {
     baseBranch = this.summary().branch,
     existingBranch = '',
     openPr = true,
-    repoUrl = ''
+    repoUrl = '',
+    workspaceMode: WorkspaceMode = 'git',
+    localPath = ''
   ): void {
     this.command('start', {
       issue_key: issueKey,
       base_branch: baseBranch,
       existing_branch: existingBranch,
       open_pr: openPr,
-      repo_url: repoUrl
+      repo_url: repoUrl,
+      workspace_mode: workspaceMode,
+      local_path: localPath
     });
     if (this.isManualMode()) {
       this.patchSummary({ status: 'waiting', runningAgent: 'None', currentAction: 'Workflow started. Jira is waiting for approval.' });
@@ -121,13 +169,15 @@ export class WorkflowStateService {
     this.patchSummary({ status: 'failed', currentAction: 'Workflow stopped' });
   }
 
-  restartWorkflow(existingBranch = '', openPr = true, repoUrl = ''): void {
+  restartWorkflow(existingBranch = '', openPr = true, repoUrl = '', workspaceMode: WorkspaceMode = 'git', localPath = ''): void {
     this.command('restart', {
       issue_key: this.summary().ticket,
       base_branch: this.summary().branch,
       existing_branch: existingBranch,
       open_pr: openPr,
-      repo_url: repoUrl
+      repo_url: repoUrl,
+      workspace_mode: workspaceMode,
+      local_path: localPath
     });
     this.snapshot.set(createMockSnapshot());
   }
@@ -144,7 +194,7 @@ export class WorkflowStateService {
 
   runNextAgent(): void {
     this.command('run-next-agent');
-    this.patchSummary({ status: 'running', runningAgent: this.summary().nextAgent, currentAction: `Running ${this.summary().nextAgent}` });
+    this.patchSummary({ status: 'running', runningAgent: this.summary().currentAgent, currentAction: `Running ${this.summary().currentAgent}` });
   }
 
   rerunCurrentAgent(): void {
@@ -295,6 +345,7 @@ function createMockSnapshot(): WorkflowSnapshot {
       totalExecutionTime: '00:18:42',
       progress: 56,
       manualMode: true,
+      workspaceMode: 'git',
       previousAgent: 'Planner',
       currentAgent: 'Developer',
       nextAgent: 'Reviewer'
@@ -337,6 +388,18 @@ function createMockSnapshot(): WorkflowSnapshot {
     ],
     activePath: ['jira', 'orchestrator', 'repo-initial', 'knowledge', 'planner', 'developer']
   };
+}
+
+function fallbackWorkflowSteps(agents: AgentNode[]): WorkflowStep[] {
+  const preferredOrder = ['jira', 'model-selector', 'repo-initial', 'knowledge', 'planner', 'developer', 'reviewer', 'repo-final'];
+  const byId = new Map(agents.map((agent) => [agent.id, agent]));
+  return preferredOrder
+    .filter((agentId) => byId.has(agentId))
+    .map((agentId) => ({
+      id: agentId,
+      agentId,
+      name: byId.get(agentId)?.name === 'Repo' ? 'Repository' : byId.get(agentId)?.name ?? agentId
+    }));
 }
 
 function agent(

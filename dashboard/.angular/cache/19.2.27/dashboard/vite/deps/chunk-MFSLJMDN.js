@@ -1,16 +1,16 @@
 import {
-  ScrollDispatcher,
-  ScrollingModule,
-  ViewportRuler
-} from "./chunk-BXEBEBUO.js";
+  _isTestEnvironment
+} from "./chunk-X7UDBSXQ.js";
 import {
   DomPortalOutlet,
   PortalModule,
   TemplatePortal
-} from "./chunk-VBPHIX7K.js";
+} from "./chunk-AIEGEUQ7.js";
 import {
-  _isTestEnvironment
-} from "./chunk-X7UDBSXQ.js";
+  ScrollDispatcher,
+  ScrollingModule,
+  ViewportRuler
+} from "./chunk-SIPR6XLN.js";
 import {
   supportsScrollBehavior
 } from "./chunk-2O4WY5GE.js";
@@ -23,7 +23,7 @@ import {
   _getEventTarget,
   coerceArray,
   hasModifierKey
-} from "./chunk-V2G75BKM.js";
+} from "./chunk-HTWGJKA5.js";
 import {
   BidiModule,
   Directionality
@@ -31,10 +31,10 @@ import {
 import {
   _CdkPrivateStyleLoader,
   _bindEventWithOptions
-} from "./chunk-YOQOECSC.js";
+} from "./chunk-A7OHFVA2.js";
 import {
   Platform
-} from "./chunk-UMCZFHBK.js";
+} from "./chunk-MKZ6QWCC.js";
 import {
   Location
 } from "./chunk-5ZAPDDDC.js";
@@ -2886,9 +2886,10 @@ var FullscreenOverlayContainer = class _FullscreenOverlayContainer extends Overl
 })();
 
 export {
+  OverlayConfig,
   Overlay,
   CdkOverlayOrigin,
   CdkConnectedOverlay,
   OverlayModule
 };
-//# sourceMappingURL=chunk-WUUEPB5Q.js.map
+//# sourceMappingURL=chunk-MFSLJMDN.js.map

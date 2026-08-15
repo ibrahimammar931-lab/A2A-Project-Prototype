@@ -21,6 +21,8 @@ class GenerateRequest(BaseModel):
     existing_branch: str = ""
     open_pr: bool = True
     repo_url: str = ""
+    workspace_mode: Literal["git", "local"] = "git"
+    local_path: str = ""
 
     @model_validator(mode="after")
     def validate_branch_exclusivity(self):
@@ -75,6 +77,7 @@ class FileChange(BaseModel):
 class PlanningRequest(BaseModel):
     jira_ticket: JiraTicket
     project_knowledge: dict[str, Any]
+    model: str | None = None
 
 
 class PlanningResult(BaseModel):
@@ -98,6 +101,33 @@ class PlanningResult(BaseModel):
             normalized["likely_existing_files"] = normalized.pop("likely_files")
 
         normalized.setdefault("new_files", [])
+
+        # Some models — especially once multiple providers became
+        # selectable via the dashboard's manual model-selection feature —
+        # collapse a list-typed field down to a single plain string
+        # instead of a one-element JSON array (most often when there is
+        # genuinely only one item to report, e.g. a single risk). This is
+        # a formatting quirk that varies by provider/model, not a real
+        # data problem, so it's normalized here rather than left to hard-
+        # fail schema validation. Any of these fields coming back as a
+        # bare (non-empty) string is wrapped into a single-item list; None
+        # or a missing field becomes an empty list, matching each field's
+        # existing default.
+        list_fields = [
+            "requirements",
+            "implementation_steps",
+            "likely_existing_files",
+            "new_files",
+            "acceptance_criteria",
+            "risks",
+        ]
+        for field in list_fields:
+            value = normalized.get(field)
+            if isinstance(value, str):
+                normalized[field] = [value] if value.strip() else []
+            elif value is None:
+                normalized[field] = []
+
         return normalized
 
     @property
@@ -112,6 +142,7 @@ class AgentTaskRequest(BaseModel):
     likely_existing_files: list[str] = Field(default_factory=list)
     planned_new_files: list[str] = Field(default_factory=list)
     repo_files: list[RepoFile] = Field(default_factory=list)
+    model: str | None = None
 
 
 class DeveloperOutput(BaseModel):
@@ -166,6 +197,27 @@ class ReviewFeedback(BaseModel):
     requires_revision: bool = False
     rationale: str = ""
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_list_fields(cls, data: Any) -> Any:
+        # Same defensive coercion as PlanningResult, for the same reason:
+        # cross-provider model selection means any of these plain string
+        # list fields can come back as a bare string instead of a
+        # single-item array, depending on which model produced the review.
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        list_fields = ["issues", "suggestions", "security_notes", "quality_notes"]
+        for field in list_fields:
+            value = normalized.get(field)
+            if isinstance(value, str):
+                normalized[field] = [value] if value.strip() else []
+            elif value is None:
+                normalized[field] = []
+
+        return normalized
+
 
 class AgentMessage(BaseModel):
     sender: str
@@ -193,6 +245,8 @@ class GenerateResponse(BaseModel):
 
 class PrepareRepoRequest(BaseModel):
     repo_url: str | None = None
+    workspace_mode: Literal["git", "local"] = "git"
+    local_path: str | None = None
 
 
 class CreateBranchRequest(BaseModel):
@@ -205,6 +259,14 @@ class CreateBranchRequest(BaseModel):
 class ReadFilesRequest(BaseModel):
     repo_url: str
     paths: list[str]
+    # Added to fix a stale-working-tree bug: without knowing which branch
+    # to read from, /read-files had no way to guarantee it was looking at
+    # the right branch's content, or to sync the working tree against that
+    # branch's remote ref before reading. Optional so any existing caller
+    # that doesn't pass it keeps working exactly as before.
+    branch: str | None = None
+    workspace_mode: Literal["git", "local"] = "git"
+    local_path: str | None = None
 
 
 class ReadFilesResponse(BaseModel):
@@ -215,8 +277,10 @@ class ReadFilesResponse(BaseModel):
 class ApplyChangesRequest(BaseModel):
     repo_url: str
     changes: list[FileChange]
-    branch: str
+    branch: str | None = None
     commit_message: str | None = None
+    workspace_mode: Literal["git", "local"] = "git"
+    local_path: str | None = None
 
 
 class ApplyChangesResponse(BaseModel):
@@ -228,6 +292,8 @@ class ApplyChangesResponse(BaseModel):
 
 class RepoDiffRequest(BaseModel):
     repo_url: str
+    workspace_mode: Literal["git", "local"] = "git"
+    local_path: str | None = None
 
 
 class RepoDiffResponse(BaseModel):

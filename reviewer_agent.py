@@ -1,11 +1,12 @@
 import json
 import logging
 
+import litellm
 from fastapi import FastAPI, HTTPException
-from openai import OpenAI
 
 from config import (
     GROQ_API_KEY,
+    LLM_MAX_TOKENS,
     GROQ_REVIEWER_MODEL,
     check_config,
     configure_logging,
@@ -44,10 +45,6 @@ class ReviewerAgent:
     def __init__(self) -> None:
         check_config()
         self.model = GROQ_REVIEWER_MODEL
-        self.client = OpenAI(
-            api_key=GROQ_API_KEY,
-            base_url="https://api.groq.com/openai/v1",
-        )
 
     def review_code(
         self,
@@ -56,6 +53,7 @@ class ReviewerAgent:
         diff: str | None,
         explanation: str,
         repo_files: list[RepoFile] | None = None,
+        model: str | None = None,
     ) -> ReviewFeedback:
         logger.info("Reviewer agent reviewing developer output")
         prompt = (
@@ -74,8 +72,9 @@ class ReviewerAgent:
             f"{format_repo_files(repo_files or [])}"
         )
 
-        response = self.client.chat.completions.create(
-            model=self.model,
+        selected_model = model or self.model  # override from orchestrator, or fallback default
+        response = litellm.completion(
+            model=selected_model,
             messages=[
                 {
                     "role": "system",
@@ -88,6 +87,7 @@ class ReviewerAgent:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
+            max_tokens=LLM_MAX_TOKENS,
             response_format={"type": "json_object"},
         )
 
@@ -112,6 +112,7 @@ def review(message: AgentMessage) -> AgentMessage:
                 RepoFile(**repo_file)
                 for repo_file in message.payload.get("repo_files", [])
             ],
+            model=message.payload.get("model"),
         )
         return AgentMessage(
             sender="reviewer_agent",

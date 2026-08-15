@@ -11,10 +11,12 @@ import httpx
 from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from available_models import AVAILABLE_MODELS
 from config import (
     DEVELOPER_SERVICE_URL,
     JIRA_SERVICE_URL,
     KNOWLEDGE_SERVICE_URL,
+    MODEL_SELECTOR_SERVICE_URL,
     PLANNER_SERVICE_URL,
     REPO_SERVICE_URL,
     REVIEWER_SERVICE_URL,
@@ -163,6 +165,8 @@ class ManualWorkflowController:
         self.existing_branch = ""
         self.open_pr = True
         self.repo_url = ""
+        self.workspace_mode = "git"
+        self.local_path = ""
         self.status = "waiting"
         self.current_action = "Ready to start manual workflow."
         self.running_agent = "None"
@@ -181,16 +185,26 @@ class ManualWorkflowController:
 
     @property
     def steps(self) -> list[dict[str, str]]:
-        return [
+        steps = [
             {"id": "jira", "name": "Jira"},
-            {"id": "repo-initial", "name": "Repository"},
-            {"id": "knowledge", "name": "Knowledge"},
-            {"id": "planner", "name": "Planner"},
-            {"id": "developer", "name": "Developer"},
-            {"id": "reviewer", "name": "Reviewer"},
-            {"id": "developer-improve", "name": "Developer"},
-            {"id": "repo-final", "name": "Repository"},
         ]
+        if self._auto_model_selection_enabled():
+            steps.append({"id": "model-selector", "name": "Model Selector"})
+        steps.extend(
+            [
+                {"id": "repo-initial", "name": "Repository"},
+                {"id": "knowledge", "name": "Knowledge"},
+                {"id": "planner", "name": "Planner"},
+                {"id": "developer", "name": "Developer"},
+                {"id": "reviewer", "name": "Reviewer"},
+                {"id": "developer-improve", "name": "Developer"},
+                {"id": "repo-final", "name": "Repository"},
+            ]
+        )
+        return steps
+
+    def _auto_model_selection_enabled(self) -> bool:
+        return bool(globals().get("auto_model_selection", False))
 
     def _agent_id_for_step(self, step_id: str) -> str:
         # Steps that represent a re-run of an existing agent card map back to
@@ -212,6 +226,8 @@ class ManualWorkflowController:
             ("reviewer", "Reviewer"),
             ("repo-final", "Repo"),
         ]
+        if self._auto_model_selection_enabled():
+            definitions.insert(2, ("model-selector", "Model Selector"))
         return {
             agent_id: {
                 "id": agent_id,
@@ -258,6 +274,8 @@ class ManualWorkflowController:
         existing_branch: str | None = None,
         open_pr: bool | None = None,
         repo_url: str | None = None,
+        workspace_mode: str | None = None,
+        local_path: str | None = None,
     ) -> None:
         # Validate mutual exclusivity based ONLY on what was explicitly passed
         # into *this* call. Checking against the merged/fallback state (the
@@ -299,19 +317,50 @@ class ManualWorkflowController:
         self.existing_branch = existing_branch if existing_branch is not None else self.existing_branch
         self.open_pr = open_pr if open_pr is not None else self.open_pr
         self.repo_url = repo_url if repo_url is not None else self.repo_url
+        if workspace_mode is not None:
+            self.workspace_mode = workspace_mode if workspace_mode in {"git", "local"} else "git"
+        self.local_path = local_path if local_path is not None else self.local_path
+        if self.workspace_mode == "local":
+            self.open_pr = False
         self.status = "waiting"
         self.current_action = "Workflow started in manual mode. Jira is waiting for approval."
         self.running_agent = "None"
         self.started_at = time.time()
         self.step_index = 0
         self.previous_agent = "None"
-        self.current_agent = "Jira"
-        self.next_agent = "Repository"
+        self.current_agent = self.steps[0]["name"]
+        self.next_agent = self.steps[1]["name"] if len(self.steps) > 1 else "None"
         self.context = {}
         self.agents = self._initial_agents()
         self.messages = []
         self.active_path = []
         self.current_task = None
+
+    def _is_local_mode(self) -> bool:
+        return self.workspace_mode == "local"
+
+    def _ensure_dynamic_agents(self) -> None:
+        if self._auto_model_selection_enabled() and "model-selector" not in self.agents:
+            self.agents["model-selector"] = self._new_agent("model-selector", "Model Selector")
+
+    def _new_agent(self, agent_id: str, name: str) -> dict[str, Any]:
+        return {
+            "id": agent_id,
+            "name": name,
+            "status": "waiting",
+            "executionState": "Waiting",
+            "startTime": None,
+            "endTime": None,
+            "duration": "00:00:00",
+            "currentAction": "Waiting",
+            "executionCount": 0,
+            "lastExecution": "Never",
+            "messagesSent": 0,
+            "messagesReceived": 0,
+            "files": {"read": [], "modified": [], "created": []},
+            "output": {},
+            "errors": [],
+        }
 
     def request_stop(self, reason: str) -> None:
         """Interrupts whatever step is currently executing, if any, and marks
@@ -333,6 +382,7 @@ class ManualWorkflowController:
             return
 
         step = self.steps[self.step_index]
+        self._ensure_dynamic_agents()
         agent_id = self._agent_id_for_step(step["id"])
         agent = self.agents[agent_id]
         self.status = "running"
@@ -391,19 +441,20 @@ class ManualWorkflowController:
             # We prepare the repo early (idempotent call) just to get the
             # repository path for the sync; _run_repo_initial will call
             # prepare-repo again later for the actual branch setup.
-            repo_response = await post_or_raise(
-                client,
-                f"{REPO_SERVICE_URL}/prepare-repo",
-                PrepareRepoRequest(repo_url=self.repo_url or None).model_dump(),
-                "Repo prepare (pre-sync)",
-            )
-            repo = RepoInfo(**repo_response.json())
-            await post_or_raise(
-                client,
-                f"{KNOWLEDGE_SERVICE_URL}/sync-branches",
-                {"repository_path": repo.path},
-                "Knowledge sync-branches",
-            )
+            if not self._is_local_mode():
+                repo_response = await post_or_raise(
+                    client,
+                    f"{REPO_SERVICE_URL}/prepare-repo",
+                    PrepareRepoRequest(repo_url=self.repo_url or None).model_dump(),
+                    "Repo prepare (pre-sync)",
+                )
+                repo = RepoInfo(**repo_response.json())
+                await post_or_raise(
+                    client,
+                    f"{KNOWLEDGE_SERVICE_URL}/sync-branches",
+                    {"repository_path": repo.path, "model": current_model_selection.get("knowledge")},
+                    "Knowledge sync-branches",
+                )
 
             response = await client.get(f"{JIRA_SERVICE_URL}/tickets/{self.issue_key}")
             response.raise_for_status()
@@ -418,12 +469,22 @@ class ManualWorkflowController:
             response = await post_or_raise(
                 client,
                 f"{REPO_SERVICE_URL}/prepare-repo",
-                PrepareRepoRequest(repo_url=self.repo_url or None).model_dump(),
+                PrepareRepoRequest(
+                    repo_url=self.repo_url or None,
+                    workspace_mode=self.workspace_mode,
+                    local_path=self.local_path or None,
+                ).model_dump(),
                 "Repo prepare",
             )
             repo = RepoInfo(**response.json())
 
-            if self.existing_branch:
+            if self._is_local_mode():
+                branch = BranchResponse(
+                    repo_id=repo.repo_id,
+                    branch=repo.current_branch or "local",
+                    base_branch=repo.current_branch or "local",
+                )
+            elif self.existing_branch:
                 branch = BranchResponse(
                     repo_id=repo.repo_id,
                     branch=self.existing_branch,
@@ -452,6 +513,21 @@ class ManualWorkflowController:
         self._add_message("Orchestrator", "Repo", "repo.prepared", repo.model_dump(), "delivered")
         self._add_message("Orchestrator", "Repo", "repo.branch_created", branch.model_dump(), "delivered")
 
+    async def _run_model_selector(self) -> None:
+        result = await _run_model_selection()
+        self.agents["model-selector"]["output"] = result or {
+            "selection": {key: current_model_selection.get(key) for key in AGENT_KEYS},
+            "skipped": True,
+            "reason": "Model selector did not return an updated selection.",
+        }
+        self._add_message(
+            "Model Selector",
+            "Orchestrator",
+            "models.selected",
+            self.agents["model-selector"]["output"],
+            "delivered",
+        )
+
     async def _run_knowledge(self) -> None:
         repo: RepoInfo = self.context["repo"]
         branch: BranchResponse = self.context["branch"]
@@ -459,7 +535,13 @@ class ManualWorkflowController:
             response = await post_or_raise(
                 client,
                 f"{KNOWLEDGE_SERVICE_URL}/ensure-knowledge",
-                {"repository_path": repo.path, "branch": branch.branch},
+                {
+                    "repository_path": repo.path,
+                    "branch": branch.branch,
+                    "known_parent": None if self._is_local_mode() else branch.base_branch,
+                    "model": current_model_selection.get("knowledge"),
+                    "workspace_mode": self.workspace_mode,
+                },
                 "Knowledge ensure",
             )
         knowledge = response.json()
@@ -470,11 +552,11 @@ class ManualWorkflowController:
     async def _run_planner(self) -> None:
         ticket: JiraTicket = self.context["ticket"]
         knowledge: dict[str, Any] = self.context["knowledge"]
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             response = await post_or_raise(
                 client,
                 f"{PLANNER_SERVICE_URL}/plan",
-                PlanningRequest(jira_ticket=ticket, project_knowledge=knowledge).model_dump(),
+                PlanningRequest(jira_ticket=ticket, project_knowledge=knowledge, model=current_model_selection.get("planner")).model_dump(),
                 "Planner plan",
             )
         planning_result = PlanningResult(**response.json())
@@ -487,17 +569,34 @@ class ManualWorkflowController:
     async def _run_developer(self) -> None:
         ticket: JiraTicket = self.context["ticket"]
         repo: RepoInfo = self.context["repo"]
+        branch: BranchResponse = self.context["branch"]
         planning_result = self._current_planning_result()
         planned_existing_files = list(dict.fromkeys(planning_result.likely_existing_files))
         planned_new_files = list(dict.fromkeys(planning_result.new_files))
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             repo_files = []
             if planned_existing_files:
                 files_response = await post_or_raise(
                     client,
                     f"{REPO_SERVICE_URL}/read-files",
-                    ReadFilesRequest(repo_url=repo.remote_url, paths=planned_existing_files).model_dump(),
+                    # FIX: pass branch so the Repo service (a) knows which
+                    # branch's content to read, and (b) can hard-reset its
+                    # working tree to match that branch's remote state
+                    # before reading — see checkout_branch's updated
+                    # docstring in repo_agent.py. Without this, a file
+                    # committed via the GitHub Contents API moments earlier
+                    # (or on a prior run) could be genuinely absent from
+                    # this local clone's working tree and fail with
+                    # "File does not exist" despite existing in the repo's
+                    # real history.
+                    ReadFilesRequest(
+                        repo_url=repo.remote_url,
+                        paths=planned_existing_files,
+                        branch=None if self._is_local_mode() else branch.branch,
+                        workspace_mode=self.workspace_mode,
+                        local_path=repo.path if self._is_local_mode() else None,
+                    ).model_dump(),
                     "Repo read-files",
                 )
                 repo_files = ReadFilesResponse(**files_response.json()).files
@@ -513,6 +612,7 @@ class ManualWorkflowController:
                     likely_existing_files=planned_existing_files,
                     planned_new_files=planned_new_files,
                     repo_files=repo_files,
+                    model=current_model_selection.get("developer"),
                 ).model_dump(),
                 "Developer generate",
             )
@@ -529,13 +629,14 @@ class ManualWorkflowController:
 
     async def _run_reviewer(self) -> None:
         review_payload = self._latest_payload("Developer", "Reviewer") or self._review_payload()
+        review_payload["model"] = current_model_selection.get("reviewer")
         review_request = AgentMessage(
             sender="orchestrator_agent",
             receiver="reviewer_agent",
             message_type="code_review_request",
             payload=review_payload,
         )
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             reviewer_response = await post_or_raise(
                 client,
                 f"{REVIEWER_SERVICE_URL}/review",
@@ -602,10 +703,11 @@ class ManualWorkflowController:
                 "planned_new_files": planned_new_files,
                 "review_feedback": filtered_feedback.model_dump(),
                 "repo_files": [repo_file.model_dump() for repo_file in repo_files],
+                "model": current_model_selection.get("developer"),
             },
         )
 
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             improvement_response = await post_or_raise(
                 client,
                 f"{DEVELOPER_SERVICE_URL}/improve",
@@ -639,6 +741,8 @@ class ManualWorkflowController:
                     changes=[change.model_dump() for change in output.changes],
                     branch=branch.branch,
                     commit_message=f"{ticket.key} {ticket.summary}",
+                    workspace_mode=self.workspace_mode,
+                    local_path=repo.path if self._is_local_mode() else None,
                 )
                 apply_response = await post_or_raise(
                     client,
@@ -650,10 +754,16 @@ class ManualWorkflowController:
                 await post_or_raise(
                     client,
                     f"{KNOWLEDGE_SERVICE_URL}/update-knowledge",
-                    {"repository_path": repo.path, "branch": branch.branch, "changes": [change.model_dump() for change in output.changes]},
+                    {
+                        "repository_path": repo.path,
+                        "branch": branch.branch,
+                        "changes": [change.model_dump() for change in output.changes],
+                        "model": current_model_selection.get("knowledge"),
+                        "workspace_mode": self.workspace_mode,
+                    },
                     "Knowledge update",
                 )
-                if self.open_pr:
+                if self.open_pr and not self._is_local_mode():
                     pr_response = await post_or_raise(
                         client,
                         f"{REPO_SERVICE_URL}/open-pr",
@@ -773,27 +883,51 @@ class ManualWorkflowController:
         await self.run_next()
 
     def snapshot(self) -> dict[str, Any]:
+        self._ensure_dynamic_agents()
         elapsed = self._duration(self.started_at) if self.started_at else "00:00:00"
         repo = self.context.get("repo")
         branch = self.context.get("branch")
+        steps = self.steps
+        previous_step = steps[self.step_index - 1] if 0 <= self.step_index - 1 < len(steps) else None
+        current_step = steps[self.step_index] if 0 <= self.step_index < len(steps) else None
+        next_step = steps[self.step_index + 1] if 0 <= self.step_index + 1 < len(steps) else None
+        ordered_agent_ids = [self._agent_id_for_step(step["id"]) for step in self.steps]
+        ordered_agent_ids = ["orchestrator", *ordered_agent_ids]
+        ordered_agents = [
+            self.agents[agent_id]
+            for agent_id in dict.fromkeys(ordered_agent_ids)
+            if agent_id in self.agents
+        ]
         return {
             "summary": {
                 "status": self._dashboard_status(),
                 "ticket": self.issue_key,
                 "branch": branch.branch if branch else (self.existing_branch or self.base_branch or self.default_base_branch),
-                "repository": repo.remote_url if repo else (self.repo_url or os.getenv("GITHUB_REPO_URL", "Not prepared")),
+                "repository": repo.path if self._is_local_mode() and repo else (repo.remote_url if repo else (self.local_path if self._is_local_mode() else self.repo_url or os.getenv("GITHUB_REPO_URL", "Not prepared"))),
                 "runningAgent": self.running_agent,
                 "currentAction": self.current_action,
                 "totalExecutionTime": elapsed,
                 "progress": round((self.step_index / len(self.steps)) * 100),
                 "manualMode": current_mode == "manual",
+                "workspaceMode": self.workspace_mode,
                 "previousAgent": self.previous_agent,
                 "currentAgent": self.current_agent,
                 "nextAgent": self.next_agent,
+                "previousStepId": previous_step["id"] if previous_step else None,
+                "currentStepId": current_step["id"] if current_step else None,
+                "nextStepId": next_step["id"] if next_step else None,
             },
-            "agents": list(self.agents.values()),
+            "agents": ordered_agents,
             "messages": self.messages,
             "activePath": ["orchestrator", *self.active_path],
+            "workflowSteps": [
+                {
+                    "id": step["id"],
+                    "agentId": self._agent_id_for_step(step["id"]),
+                    "name": step["name"],
+                }
+                for step in steps
+            ],
         }
 
     async def broadcast(self) -> None:
@@ -865,6 +999,95 @@ class ManualWorkflowController:
 
 manual_workflow = ManualWorkflowController()
 current_mode: str = "manual"  # "manual" or "automatic"
+auto_model_selection: bool = False  # gated by /api/workflow/auto-model-selection
+
+# -- Model selection persistence (system-wide, survives reset()) ----------
+MODEL_SELECTION_FILE = "model_selection.json"
+AGENT_KEYS = ("knowledge", "planner", "developer", "reviewer")
+ALL_MODEL_SELECTION_KEYS = ("knowledge", "planner", "developer", "reviewer", "model_selector")
+
+# Default fallback: each agent key maps to the service's own config.py
+# default, which is selected inside the agent itself when model=None is
+# received. We store None in the dictionary for agents where no override
+# has been picked yet, which lets agent-level fallback happen naturally.
+_model_selection_defaults: dict[str, str | None] = {
+    "knowledge": None,
+    "planner": None,
+    "developer": None,
+    "reviewer": None,
+    "model_selector": None,
+}
+
+
+def _load_model_selection() -> dict[str, str | None]:
+    """Load persisted model selection from MODEL_SELECTION_FILE.
+
+    Returns a dict mapping each agent key to a LiteLLM model id, or None
+    if no override has been saved yet or the saved model is no longer in
+    AVAILABLE_MODELS. Missing keys are filled with None from
+    _model_selection_defaults.
+
+    If any stale model ids (not in AVAILABLE_MODELS) are found in the file,
+    they are sanitized to None and the file is rewritten immediately so the
+    invalid entries are gone from disk on the next load — no manual cleanup
+    required.
+    """
+    available_ids = {entry["id"] for entry in AVAILABLE_MODELS}
+    try:
+        with open(MODEL_SELECTION_FILE, encoding="utf-8") as f:
+            raw = json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return dict(_model_selection_defaults)
+
+    result: dict[str, str | None] = {}
+    needs_save = False
+    for key in ALL_MODEL_SELECTION_KEYS:
+        val = raw.get(key)
+        if isinstance(val, str) and val.strip():
+            model_id = val.strip()
+            if model_id in available_ids:
+                result[key] = model_id
+            else:
+                logger.warning(
+                    "Ignoring saved model selection for %s: %s is not in "
+                    "AVAILABLE_MODELS — sanitizing file",
+                    key,
+                    model_id,
+                )
+                result[key] = None
+                needs_save = True
+        else:
+            result[key] = None
+
+    if needs_save:
+        _save_model_selection(result)
+
+    return result
+
+
+def _save_model_selection(selection: dict[str, str | None]) -> None:
+    """Write the current model selection dict to MODEL_SELECTION_FILE.
+    Only persists keys in ALL_MODEL_SELECTION_KEYS."""
+    available_ids = {entry["id"] for entry in AVAILABLE_MODELS}
+    out: dict[str, str | None] = {}
+    for key in ALL_MODEL_SELECTION_KEYS:
+        value = selection.get(key)
+        out[key] = value if value in available_ids else None
+    with open(MODEL_SELECTION_FILE, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+
+
+current_model_selection: dict[str, str | None] = _load_model_selection()
+
+
+def _credentialed_model_ids() -> set[str]:
+    """Return the set of AVAILABLE_MODELS ids whose requires_env is set."""
+    credentialed: set[str] = set()
+    for entry in AVAILABLE_MODELS:
+        env_var = entry.get("requires_env", "")
+        if env_var and os.getenv(env_var):
+            credentialed.add(entry["id"])
+    return credentialed
 
 
 def command_result(command: str) -> dict[str, Any]:
@@ -921,6 +1144,141 @@ async def workflow_get_mode() -> dict[str, Any]:
     return {"mode": current_mode}
 
 
+HEALTH_CHECK_PROMPT = "Say the word healthy and nothing else."
+HEALTH_CHECK_TIMEOUT = 15
+
+
+async def _check_model_health(model_id: str) -> bool:
+    """Single-shot LiteLLM health ping from the orchestrator.
+
+    Kept separate from the Model Selector's own health check so the
+    orchestrator can pre-filter candidates without depending on the
+    selector being available.
+    """
+    import litellm
+
+    try:
+        response = litellm.completion(
+            model=model_id,
+            messages=[{"role": "user", "content": HEALTH_CHECK_PROMPT}],
+            max_tokens=5,
+            timeout=HEALTH_CHECK_TIMEOUT,
+        )
+        return bool(response and response.choices)
+    except Exception:
+        return False
+
+
+async def _run_model_selection() -> dict[str, Any] | None:
+    """Call the Model Selector agent and persist its returned assignments.
+
+    Only ever overwrites the 4 agent keys (knowledge, planner, developer,
+    reviewer). ``model_selector`` is a fixed, human-controlled setting —
+    this function's job is choosing models *for* the 4 agents, never for
+    itself. The Model Selector service now fails loudly (503) instead of
+    silently swapping when its configured model is unhealthy, so there is
+    no "swapped" case to handle or persist here anymore.
+
+    Every candidate model is health-checked **before** the list is sent to
+    the selector — only models that respond to a trivial ping are included.
+    """
+    global current_model_selection
+
+    # Build candidate list from credentialed AVAILABLE_MODELS enriched with
+    # capabilities and power so the selector has all the context it needs.
+    credentialed = _credentialed_model_ids()
+    all_candidates = [
+        {
+            "id": entry["id"],
+            "label": entry["label"],
+            "capabilities": entry.get("capabilities", "unknown"),
+            "power": entry.get("power", 1),
+        }
+        for entry in AVAILABLE_MODELS
+        if entry["id"] in credentialed
+    ]
+
+    if not all_candidates:
+        logger.warning("No credentialed models available — skipping model selection")
+        return None
+
+    # ---- Health-check every candidate; only keep the healthy ones -------
+    manual_workflow.current_action = "Health-checking candidate models..."
+    await manual_workflow.broadcast()
+
+    healthy_candidates: list[dict] = []
+    unhealthy: list[str] = []
+    for c in all_candidates:
+        cid = c["id"]
+        if await _check_model_health(cid):
+            healthy_candidates.append(c)
+            logger.info("Candidate %s is healthy", cid)
+        else:
+            unhealthy.append(cid)
+            logger.warning("Candidate %s is unhealthy — excluded from selection", cid)
+
+    if not healthy_candidates:
+        logger.warning("All candidate models failed health checks — skipping model selection")
+        return None
+
+    if unhealthy:
+        logger.info(
+            "Filtered %d unhealthy candidates: %s",
+            len(unhealthy),
+            ", ".join(unhealthy),
+        )
+
+    ticket: JiraTicket | None = manual_workflow.context.get("ticket")
+    ticket_text = ticket_to_task(ticket) if ticket else ""
+
+    # The model_selector agent reads its own model from model_selection.json
+    # itself — we don't pass a current_selection payload for it here.
+    payload = {
+        "ticket": ticket_text,
+        "candidates": healthy_candidates,
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        try:
+            response = await client.post(
+                f"{MODEL_SELECTOR_SERVICE_URL}/select-models",
+                json=payload,
+            )
+            response.raise_for_status()
+        except Exception:
+            logger.exception("Model selector call failed — keeping current selection")
+            return None
+
+    result = response.json()
+    selection: dict[str, str] = result.get("selection") or {}
+
+    # Only the 4 role keys are ever written here. model_selector is a fixed,
+    # human-controlled setting (see model_selection.json /
+    # workflow_set_model_selection) — this function never touches it,
+    # regardless of what the selector service reports about itself.
+    # Reload from disk before applying the partial update. This prevents a
+    # long-running server from writing an old in-memory model_selector value
+    # back over a manual edit to model_selection.json.
+    updated = _load_model_selection()
+    for key in AGENT_KEYS:
+        if key in selection:
+            updated[key] = selection[key]
+
+    current_model_selection = updated
+    _save_model_selection(updated)
+    logger.info(
+        "Model selection updated: %s (selector_model_used=%s)",
+        {k: updated.get(k) for k in AGENT_KEYS},
+        result.get("selector_model_used"),
+    )
+    return {
+        **result,
+        "selection": {key: updated.get(key) for key in AGENT_KEYS},
+        "unhealthy_candidates": unhealthy,
+        "healthy_candidate_count": len(healthy_candidates),
+    }
+
+
 async def _run_automatic_workflow() -> None:
     """Runs all workflow steps sequentially without waiting for manual approval.
 
@@ -929,10 +1287,24 @@ async def _run_automatic_workflow() -> None:
     another request, which surfaces here as status flipping to "failed" the
     moment that run_next() call returns — the loop condition below then exits
     without kicking off another step.
+
+    Model selection (when enabled) runs **after** the Jira step, so the
+    ticket context has already been populated and can be fed to the
+    selector agent.
     """
     manual_workflow.current_action = "Automatic workflow running..."
     manual_workflow.status = "running"
     await manual_workflow.broadcast()
+
+    # Run the Jira step first so the ticket is available for model selection
+    if manual_workflow.step_index == 0:
+        await manual_workflow.run_next()
+        if manual_workflow.status == "failed":
+            await manual_workflow.broadcast()
+            return
+        manual_workflow.status = "running"
+
+    # Run remaining steps
     while manual_workflow.status not in {"failed", "completed"} and manual_workflow.step_index < len(manual_workflow.steps):
         await manual_workflow.run_next()
         if manual_workflow.status == "waiting":
@@ -949,6 +1321,8 @@ async def workflow_start(payload: dict[str, Any] = Body(default_factory=dict)) -
         existing_branch=payload.get("existing_branch"),
         open_pr=payload.get("open_pr"),
         repo_url=payload.get("repo_url"),
+        workspace_mode=payload.get("workspace_mode"),
+        local_path=payload.get("local_path"),
     )
     await manual_workflow.broadcast()
     if current_mode == "automatic":
@@ -991,11 +1365,17 @@ async def workflow_restart(payload: dict[str, Any] = Body(default_factory=dict))
     issue_key = payload["issue_key"] if "issue_key" in payload else manual_workflow.issue_key
     base_branch = payload["base_branch"] if "base_branch" in payload else manual_workflow.base_branch
     existing_branch = payload["existing_branch"] if "existing_branch" in payload else manual_workflow.existing_branch
+    repo_url = payload["repo_url"] if "repo_url" in payload else manual_workflow.repo_url
+    workspace_mode = payload["workspace_mode"] if "workspace_mode" in payload else manual_workflow.workspace_mode
+    local_path = payload["local_path"] if "local_path" in payload else manual_workflow.local_path
     manual_workflow.reset(
         issue_key=issue_key,
         base_branch=base_branch,
         existing_branch=existing_branch,
         open_pr=payload.get("open_pr") if "open_pr" in payload else manual_workflow.open_pr,
+        repo_url=repo_url,
+        workspace_mode=workspace_mode,
+        local_path=local_path,
     )
     await manual_workflow.broadcast()
     return command_result("restart")
@@ -1044,5 +1424,106 @@ async def workflow_send_edited_message(payload: dict[str, Any] = Body(...)) -> d
     return command_result("send-edited-message")
 
 
+# -- Model selection endpoints ---------------------------------------------
 
 
+@app.get("/api/workflow/available-models")
+async def workflow_available_models() -> list[dict[str, str]]:
+    """Return the credentialed subset of AVAILABLE_MODELS.
+
+    Only entries whose ``requires_env`` environment variable is currently
+    set (non-empty) are included — the dashboard dropdown never shows an
+    option that would fail for lack of an API key.
+    """
+    return [
+        {"id": entry["id"], "label": entry["label"], "provider": entry["provider"]}
+        for entry in AVAILABLE_MODELS
+        if os.getenv(entry.get("requires_env", ""))
+    ]
+
+
+@app.get("/api/workflow/model-selection")
+async def workflow_get_model_selection() -> dict[str, str | None]:
+    """Return the current per-agent model selection dict.
+
+    A null value for an agent means "no override — use the agent's own
+    hardcoded default".
+    """
+    return dict(current_model_selection)
+
+
+@app.post("/api/workflow/model-selection")
+async def workflow_set_model_selection(payload: dict[str, Any] = Body(...)) -> dict[str, str | None]:
+    """Update per-agent model selection.
+
+    Accepts a partial dict — only keys present in the payload are updated;
+    omitted keys keep their current value. Validates that any provided
+    model id exists in AVAILABLE_MODELS AND is currently credentialed.
+    """
+    global current_model_selection
+    credentialed = _credentialed_model_ids()
+
+    updated = dict(current_model_selection)
+    for key in ALL_MODEL_SELECTION_KEYS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if value is None or (isinstance(value, str) and not value.strip()):
+            # Explicitly clearing the override — store None to fall back to
+            # the agent's own default.
+            updated[key] = None
+            continue
+        if not isinstance(value, str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model id for '{key}' must be a string, got {type(value).__name__}",
+            )
+        model_id = value.strip()
+        if model_id not in credentialed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model_id}' is not available — it is either not in the "
+                f"AVAILABLE_MODELS list or its required API key is not configured.",
+            )
+        updated[key] = model_id
+
+    current_model_selection = updated
+    _save_model_selection(updated)
+    return dict(current_model_selection)
+
+
+# -- Auto model selection endpoints -----------------------------------------
+
+
+@app.get("/api/workflow/auto-model-selection")
+async def workflow_get_auto_model_selection() -> dict[str, bool]:
+    """Return whether LLM-based model selection runs before each workflow."""
+    return {"enabled": auto_model_selection}
+
+
+@app.post("/api/workflow/set-auto-model-selection")
+async def workflow_set_auto_model_selection(
+    payload: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    """Enable or disable automatic LLM-based model selection.
+
+    When enabled, the orchestrator calls the Model Selector agent before
+    each automatic workflow run and overwrites the per-agent model choices
+    with its recommendations.
+    """
+    global auto_model_selection
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(
+            status_code=400,
+            detail="'enabled' must be a boolean",
+        )
+    auto_model_selection = enabled
+    manual_workflow._ensure_dynamic_agents()
+    await manual_workflow.broadcast()
+    return {
+        "command": "set-auto-model-selection",
+        "accepted": True,
+        "enabled": auto_model_selection,
+        "timestamp": manual_workflow._now(),
+    }

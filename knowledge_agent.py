@@ -6,12 +6,12 @@ import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
+import litellm
 from fastapi import FastAPI, HTTPException
-from openai import OpenAI
 
-from config import GROQ_API_KEY, GROQ_MODEL, check_config, configure_logging
+from config import GROQ_API_KEY, LLM_MAX_TOKENS, GROQ_MODEL, LOCAL_KNOWLEDGE_ROOT, check_config, configure_logging
 from schemas import FileChange
 
 configure_logging()
@@ -34,6 +34,20 @@ def _branch_slug(branch: str) -> str:
     return re.sub(r'[\/\\:*?"<>|]', "-", branch)
 
 
+def _local_repo_id(repository_path: str) -> str:
+    """Stable, path-derived cache key for local-mode knowledge.
+
+    Mirrors repo_agent.py's local_repo_id in spirit, but this service keeps
+    its own copy rather than importing across services. Resolving the path
+    first means the same folder always produces the same id regardless of
+    how it was referenced (relative vs absolute, trailing slash, symlink
+    hops aside) across repeated runs.
+    """
+    resolved = Path(repository_path).resolve()
+    digest = hashlib.sha1(str(resolved).encode("utf-8")).hexdigest()[:10]
+    return f"local-{_branch_slug(resolved.name) or 'repo'}-{digest}"
+
+
 # -- Git helpers -----------------------------------------------------------
 #
 # DESIGN NOTE: The Knowledge Agent performs its own read-only git
@@ -43,6 +57,13 @@ def _branch_slug(branch: str) -> str:
 # local lookups.  The Repo service is still responsible for cloning,
 # branch creation, applying changes, and pushing — Knowledge only reads
 # git state and checks out branches locally.
+#
+# In local mode, the same read-only commands (rev-parse, diff, show,
+# branch --show-current) are still safe to run unmodified against a real
+# local checkout — see the constraint in the task spec. Only the
+# unconditional `fetch --all --prune` in ensure_knowledge is skipped for
+# local mode, and it is skipped at the call site below, not in this
+# helper layer, so these git helpers stay identical between modes.
 
 def _run_git(repo_path: Path, args: list[str]) -> str:
     """Run a read-only git command in *repo_path* and return stdout."""
@@ -62,15 +83,28 @@ def _run_git(repo_path: Path, args: list[str]) -> str:
 
 
 def _get_head_sha(repo_path: Path, branch: str) -> str | None:
-    """Return the commit SHA for the tip of *branch*, or None if unresolvable."""
+    """Return the commit SHA for the tip of *branch*, or None if unresolvable.
+
+    DESIGN CHOICE: the remote-tracking ref (``refs/remotes/origin/<branch>``)
+    is checked *first*, ahead of the local ref. Changes land on GitHub via
+    the Contents API (see ``_read_file_at_commit`` below) rather than local
+    commits, so after a ``git fetch`` the remote-tracking ref is what
+    actually reflects the branch's true current tip — a stale local ref
+    left over from an earlier checkout would otherwise report an outdated
+    SHA and make already-synced branches look up to date when they are not.
+
+    For a plain (non-git) local-mode folder, or a local git checkout with
+    no matching ref, both rev-parse attempts fail and this returns None —
+    callers already treat that as "can't resolve HEAD" and degrade
+    gracefully (skip drift refresh, record source_sha="unknown").
+    """
     try:
-        # Try local ref first, then remote tracking ref
-        sha = _run_git(repo_path, ["rev-parse", f"refs/heads/{branch}"])
+        sha = _run_git(repo_path, ["rev-parse", f"refs/remotes/origin/{branch}"])
         return sha
     except RuntimeError:
         pass
     try:
-        sha = _run_git(repo_path, ["rev-parse", f"refs/remotes/origin/{branch}"])
+        sha = _run_git(repo_path, ["rev-parse", f"refs/heads/{branch}"])
         return sha
     except RuntimeError:
         return None
@@ -125,6 +159,14 @@ def _read_file_at_commit(repo_path: Path, sha: str, path: str) -> str | None:
 
     Returns None if the path does not exist at that commit (e.g. it was
     deleted), distinguishing "genuinely absent" from other read failures.
+
+    NOTE: in local mode this path is effectively unused for content lookup
+    — local `apply_changes` writes to the working tree directly (no commit
+    at all) and the orchestrator always calls `/update-knowledge` with
+    explicit `content` already attached to each FileChange (Developer's own
+    output), so `update_knowledge`'s content=None branch that calls this
+    is only ever exercised for the read-only git-history drift-refresh
+    path, which is fine for a real git checkout in local mode.
     """
     posix_path = path.replace("\\", "/")
     try:
@@ -141,19 +183,21 @@ def _read_file_at_commit(repo_path: Path, sha: str, path: str) -> str | None:
 class KnowledgeAgent:
     def __init__(self) -> None:
         check_config()
-        self.client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+        self.model = GROQ_MODEL
 
     # -- Branch-scoped directory helpers -----------------------------------
 
-    def _knowledge_dir(self, repository_path: str, branch: str) -> Path:
+    def _knowledge_dir(self, repository_path: str, branch: str, local: bool = False) -> Path:
         slug = _branch_slug(branch)
+        if local:
+            return LOCAL_KNOWLEDGE_ROOT.resolve() / _local_repo_id(repository_path) / slug
         return Path(repository_path).resolve() / "knowledge" / slug
 
-    def _files_dir(self, repository_path: str, branch: str) -> Path:
-        return self._knowledge_dir(repository_path, branch) / "files"
+    def _files_dir(self, repository_path: str, branch: str, local: bool = False) -> Path:
+        return self._knowledge_dir(repository_path, branch, local=local) / "files"
 
-    def _read_metadata(self, repository_path: str, branch: str) -> dict[str, Any]:
-        metadata_path = self._knowledge_dir(repository_path, branch) / "metadata.json"
+    def _read_metadata(self, repository_path: str, branch: str, local: bool = False) -> dict[str, Any]:
+        metadata_path = self._knowledge_dir(repository_path, branch, local=local) / "metadata.json"
         if metadata_path.exists():
             try:
                 return json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -161,10 +205,112 @@ class KnowledgeAgent:
                 return {}
         return {}
 
-    def _write_metadata(self, repository_path: str, branch: str, metadata: dict[str, Any]) -> None:
-        metadata_path = self._knowledge_dir(repository_path, branch) / "metadata.json"
+    def _write_metadata(self, repository_path: str, branch: str, metadata: dict[str, Any], local: bool = False) -> None:
+        metadata_path = self._knowledge_dir(repository_path, branch, local=local) / "metadata.json"
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # -- Drift refresh (shared) ---------------------------------------------
+
+    def _refresh_if_drifted(
+        self,
+        repository_path: str,
+        branch: str,
+        model: str | None = None,
+        local: bool = False,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """Bring a branch's knowledge up to date with its current HEAD, if needed.
+
+        Compares the branch's stored ``source_sha`` against its actual
+        current HEAD (resolved via ``_get_head_sha``, which prefers the
+        remote-tracking ref). If they match, nothing happens. If they
+        differ, this diffs ``stored_sha..current_sha`` and patches in only
+        the changed files via ``update_knowledge`` — the same targeted,
+        LLM-only-where-needed approach ``sync_all_branches`` has always
+        used, now factored out so ``ensure_knowledge`` and
+        ``_copy_branch_knowledge`` can call it too instead of only ever
+        refreshing during an explicit ``/sync-branches`` run.
+
+        Returns ``(metadata, drifted)`` where ``drifted`` is True if the
+        branch's knowledge content actually changed (rebuilt or patched),
+        and False if it was already current, could not be resolved, or the
+        SHA moved without any file-level changes (e.g. an empty merge).
+
+        In local mode this only ever touches read-only git commands
+        (rev-parse, diff, show), which is exactly what the local-mode
+        contract allows. For a plain non-git local folder, ``_get_head_sha``
+        returns None and this bails out on the "cannot resolve HEAD" branch
+        below — no rebuild, no error, existing knowledge is used as-is.
+        """
+        repo = Path(repository_path).resolve()
+        metadata = self._read_metadata(repository_path, branch, local=local)
+        stored_sha = metadata.get("source_sha")
+        current_sha = _get_head_sha(repo, branch)
+
+        if current_sha is None:
+            logger.warning("Cannot resolve HEAD for branch %s — skipping drift refresh", branch)
+            return metadata, False
+
+        if stored_sha == current_sha:
+            return metadata, False
+
+        logger.info(
+            "Branch %s drifted from %s to %s — refreshing knowledge",
+            branch,
+            stored_sha or "unknown",
+            current_sha,
+        )
+
+        if not stored_sha:
+            # No baseline to diff against — rebuild fully.
+            return self.build_knowledge(repository_path, branch, model=model, local=local), True
+
+        try:
+            changed_files_raw = _run_git(repo, ["diff", "--name-only", stored_sha, current_sha])
+        except RuntimeError:
+            # Old SHA isn't reachable (e.g. force-push) — rebuild from scratch.
+            logger.warning(
+                "Cannot diff %s..%s for branch %s — rebuilding from scratch",
+                stored_sha,
+                current_sha,
+                branch,
+            )
+            return self.build_knowledge(repository_path, branch, model=model, local=local), True
+
+        changed_paths = [p.strip() for p in changed_files_raw.splitlines() if p.strip()]
+
+        if not changed_paths:
+            # SHA moved but nothing file-level changed (e.g. an empty merge
+            # commit) — just bump source_sha, no content to refresh.
+            metadata["source_sha"] = current_sha
+            metadata["generated_at"] = datetime.utcnow().isoformat() + "Z"
+            self._write_metadata(repository_path, branch, metadata, local=local)
+            return metadata, False
+
+        # BUG FIX: this used to decide update-vs-delete by checking
+        # `(repo / path).exists()` against the local working tree. That is
+        # the wrong source of truth — per the design note on
+        # `_read_file_at_commit`, changes land via the GitHub Contents API,
+        # not local commits, so the working tree is very often checked out
+        # to an entirely different branch or a stale commit. A file that
+        # genuinely exists on `branch` at `current_sha` but happens to be
+        # absent from whatever is currently checked out locally would get
+        # misclassified as "delete" here, wiping out its knowledge entry
+        # even though the file is present and unchanged content-wise —
+        # producing near-empty knowledge for a branch that actually has
+        # plenty of files. `update_knowledge` already resolves this
+        # correctly and safely: for action="update" with content=None it
+        # reads via `_read_file_at_commit` (git's object store at the real
+        # commit, bypassing the working tree) and treats a genuine "not
+        # present at that commit" result as a delete on its own. So every
+        # changed path is passed through as "update" and update_knowledge
+        # makes the real update-vs-delete call using git, not the disk.
+        changes: List[FileChange] = [
+            FileChange(path=path, action="update", content=None) for path in changed_paths
+        ]
+
+        result = self.update_knowledge(repository_path, branch, changes, model=model, local=local)
+        return result["metadata"], True
 
     # -- Public API (branch-scoped) ----------------------------------------
 
@@ -173,6 +319,8 @@ class KnowledgeAgent:
         repository_path: str,
         branch: str,
         known_parent: str | None = None,
+        model: str | None = None,
+        local: bool = False,
     ) -> Dict[str, Any]:
         """Return loaded knowledge; build (or copy from a known parent) if missing.
 
@@ -183,19 +331,40 @@ class KnowledgeAgent:
         cheaper and correct. Whatever the branch's own work changes later
         gets patched in by the normal ``update_knowledge`` call at the end
         of the workflow (e.g. Repo-final applying the Developer's changes).
+
+        In git mode, this fetches remote state up front so SHA comparisons
+        below reflect the real current tip on GitHub. In local mode the
+        fetch is skipped entirely — local mode has no `origin` fetch
+        contract at all (the workflow never mutates or syncs with a
+        remote), and running it unconditionally against a real local
+        checkout's `origin` would violate the "no git mutation" rule for
+        local mode even though `fetch` is nominally read-only, since it can
+        still write into the user's own `.git` (remote-tracking refs,
+        reflogs) without their asking for it.
         """
-        knowledge_dir = self._knowledge_dir(repository_path, branch)
+        repo = Path(repository_path).resolve()
+        if not local:
+            try:
+                _run_git(repo, ["fetch", "--all", "--prune"])
+            except RuntimeError as exc:
+                logger.warning("Fetch failed during ensure_knowledge for %s: %s", branch, exc)
+
+        knowledge_dir = self._knowledge_dir(repository_path, branch, local=local)
         if not knowledge_dir.exists():
             if known_parent:
-                parent_dir = self._knowledge_dir(repository_path, known_parent)
+                parent_dir = self._knowledge_dir(repository_path, known_parent, local=local)
                 if parent_dir.exists():
                     logger.info(
                         "Knowledge directory missing for branch %s — copying from known parent '%s'",
                         branch,
                         known_parent,
                     )
-                    self._copy_branch_knowledge(repository_path, known_parent, branch)
-                    return self.load_knowledge(repository_path, branch)
+                    # Refresh the parent first so we copy a baseline that
+                    # reflects its true current state, not a stale one that
+                    # predates commits which have since landed on GitHub.
+                    self._refresh_if_drifted(repository_path, known_parent, model=model, local=local)
+                    self._copy_branch_knowledge(repository_path, known_parent, branch, model=model, local=local)
+                    return self.load_knowledge(repository_path, branch, local=local)
                 logger.info(
                     "Known parent '%s' has no knowledge either — falling back to full build for %s",
                     known_parent,
@@ -206,7 +375,7 @@ class KnowledgeAgent:
                     "Knowledge directory missing for branch %s and no known parent given — building from scratch",
                     branch,
                 )
-            self.build_knowledge(repository_path, branch)
+            self.build_knowledge(repository_path, branch, model=model, local=local)
             # NOTE: build_knowledge/_copy_branch_knowledge return the raw
             # metadata dict (where "files" is an integer count). Callers of
             # ensure_knowledge (e.g. the Planner) expect the same shape as
@@ -219,32 +388,44 @@ class KnowledgeAgent:
             # knowledge took the load_knowledge path below instead and never
             # hit this bug. Always route through load_knowledge here so
             # ensure_knowledge has exactly one return shape, always.
-            return self.load_knowledge(repository_path, branch)
+            return self.load_knowledge(repository_path, branch, local=local)
 
         logger.info("Loading existing knowledge for %s (branch %s)", repository_path, branch)
-        return self.load_knowledge(repository_path, branch)
+        # The branch may have moved since knowledge was last built or
+        # updated — refresh any drift before handing knowledge back. This
+        # only uses read-only git commands, so it's safe to run in local
+        # mode against a real checkout; for a plain non-git folder or one
+        # with no resolvable HEAD it's a no-op (see _refresh_if_drifted).
+        self._refresh_if_drifted(repository_path, branch, model=model, local=local)
+        return self.load_knowledge(repository_path, branch, local=local)
 
-    def build_knowledge(self, repository_path: str, branch: str) -> Dict[str, Any]:
+    def build_knowledge(self, repository_path: str, branch: str, model: str | None = None, local: bool = False) -> Dict[str, Any]:
         """Scan repository and build per-file knowledge artifacts (do not store code).
 
         Records the current HEAD commit SHA as ``source_sha`` in metadata
-        so subsequent sync runs can detect drift.
+        so subsequent sync runs can detect drift. In local mode against a
+        plain (non-git) folder, ``_get_head_sha`` resolves to None and
+        ``source_sha`` is recorded as ``"unknown"`` — this is expected and
+        handled gracefully everywhere source_sha is read.
         """
         repo = Path(repository_path).resolve()
         if not repo.exists():
             raise ValueError(f"Repository path does not exist: {repository_path}")
 
-        knowledge_dir = self._knowledge_dir(repository_path, branch)
+        knowledge_dir = self._knowledge_dir(repository_path, branch, local=local)
         if knowledge_dir.exists():
             logger.info("Removing existing knowledge before rebuild: %s", knowledge_dir)
             shutil.rmtree(knowledge_dir)
 
-        files_dir = self._files_dir(repository_path, branch)
+        files_dir = self._files_dir(repository_path, branch, local=local)
         files_dir.mkdir(parents=True, exist_ok=True)
 
         summary_count = 0
-        knowledge_dir = self._knowledge_dir(repository_path, branch)
+        knowledge_dir = self._knowledge_dir(repository_path, branch, local=local)
         for path in repo.rglob("**/*"):
+            # In local mode knowledge_dir lives outside repo entirely (under
+            # LOCAL_KNOWLEDGE_ROOT), so this check simply never matches —
+            # left unconditional since it's a correct no-op either way.
             if path == knowledge_dir or knowledge_dir in path.parents:
                 logger.debug("Skipping generated knowledge path: %s", path)
                 continue
@@ -269,7 +450,7 @@ class KnowledgeAgent:
                 continue
 
             rel = path.relative_to(repo)
-            knowledge = self._summarize_file(str(rel), content)
+            knowledge = self._summarize_file(str(rel), content, model=model)
 
             out_path = files_dir / rel
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -287,9 +468,10 @@ class KnowledgeAgent:
             "branch": branch,
             "files": summary_count,
             "source_sha": source_sha,
+            "local": local,
         }
 
-        metadata_path = self._knowledge_dir(repository_path, branch) / "metadata.json"
+        metadata_path = self._knowledge_dir(repository_path, branch, local=local) / "metadata.json"
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -301,10 +483,12 @@ class KnowledgeAgent:
         repository_path: str,
         source_branch: str,
         new_branch: str,
+        model: str | None = None,
+        local: bool = False,
     ) -> Dict[str, Any]:
         """Copy an existing branch's knowledge into a new branch's knowledge
         directory via a plain filesystem copy — no LLM calls. Used when a new
-        branch is created and its base branch already has knowledge built.
+        branch is created and its base branch already has knowledge.
 
         After copying, updates the copied metadata's `branch` field to
         `new_branch` and its `source_sha` to `new_branch`'s own current HEAD
@@ -313,14 +497,32 @@ class KnowledgeAgent:
         new branch, rather than reusing the source's SHA, keeps this correct
         even if called slightly after creation, e.g. if a commit or two has
         already landed on the new branch before this runs).
+
+        IMPORTANT: relabeling metadata's ``source_sha`` to ``new_branch``'s
+        current HEAD is not, by itself, enough to make that true — the files
+        that were actually copied only reflect content as of the *source*
+        branch's own ``source_sha`` at copy time. If ``new_branch`` already
+        has commits beyond that baseline (the case described above), simply
+        overwriting the label would mask the drift: the metadata would claim
+        to be current as of ``new_branch``'s HEAD while the file contents
+        still describe the older, copied baseline. So after relabeling, this
+        diffs the copied baseline against ``new_branch``'s actual HEAD and,
+        if they differ, patches in the difference via ``update_knowledge``
+        so the copy is genuinely accurate rather than just labeled as such.
+
+        Not called at all in local mode's own new-branch path today (local
+        mode never creates a branch), but kept local-aware since
+        ensure_knowledge's known_parent copy path can still reach it — e.g.
+        a local checkout whose current branch has no knowledge yet but a
+        base branch's local-mode knowledge already exists in the cache.
         """
-        source_dir = self._knowledge_dir(repository_path, source_branch)
+        source_dir = self._knowledge_dir(repository_path, source_branch, local=local)
         if not source_dir.exists():
             raise ValueError(
                 f"Cannot copy knowledge: source branch '{source_branch}' has no existing knowledge"
             )
 
-        dest_dir = self._knowledge_dir(repository_path, new_branch)
+        dest_dir = self._knowledge_dir(repository_path, new_branch, local=local)
         if dest_dir.exists():
             logger.info("Removing existing knowledge before copy: %s", dest_dir)
             shutil.rmtree(dest_dir)
@@ -330,12 +532,52 @@ class KnowledgeAgent:
         repo = Path(repository_path).resolve()
         new_branch_sha = _get_head_sha(repo, new_branch)
 
-        metadata = self._read_metadata(repository_path, new_branch)
+        metadata = self._read_metadata(repository_path, new_branch, local=local)
+        # The SHA the copied files actually reflect, before we relabel it.
+        copied_baseline_sha = metadata.get("source_sha")
         metadata["branch"] = new_branch
         metadata["generated_at"] = datetime.utcnow().isoformat() + "Z"
         if new_branch_sha:
             metadata["source_sha"] = new_branch_sha
-        self._write_metadata(repository_path, new_branch, metadata)
+        self._write_metadata(repository_path, new_branch, metadata, local=local)
+
+        if (
+            new_branch_sha
+            and copied_baseline_sha
+            and copied_baseline_sha != new_branch_sha
+        ):
+            logger.info(
+                "Copied baseline for %s (%s) differs from its actual HEAD (%s) — refreshing to catch up",
+                new_branch,
+                copied_baseline_sha,
+                new_branch_sha,
+            )
+            try:
+                changed_files_raw = _run_git(repo, ["diff", "--name-only", copied_baseline_sha, new_branch_sha])
+                changed_paths = [p.strip() for p in changed_files_raw.splitlines() if p.strip()]
+                if changed_paths:
+                    # Same fix as _refresh_if_drifted: don't classify
+                    # update-vs-delete from `(repo / path).exists()` — the
+                    # working tree may not be checked out to `new_branch` at
+                    # all, so that check tells us nothing reliable about
+                    # what actually exists on this branch. Pass every path
+                    # through as "update" with content=None and let
+                    # update_knowledge resolve real existence via
+                    # `_read_file_at_commit` against `new_branch_sha`
+                    # itself.
+                    changes: List[FileChange] = [
+                        FileChange(path=path, action="update", content=None) for path in changed_paths
+                    ]
+                    update_result = self.update_knowledge(repository_path, new_branch, changes, model=model, local=local)
+                    metadata = update_result["metadata"]
+            except RuntimeError as exc:
+                logger.warning(
+                    "Could not diff %s..%s to refresh copied knowledge for %s (%s) — leaving as copied",
+                    copied_baseline_sha,
+                    new_branch_sha,
+                    new_branch,
+                    exc,
+                )
 
         logger.info(
             "Copied knowledge for branch '%s' from '%s' (%d files, SHA %s)",
@@ -346,7 +588,14 @@ class KnowledgeAgent:
         )
         return metadata
 
-    def update_knowledge(self, repository_path: str, branch: str, changes: List[FileChange]) -> Dict[str, Any]:
+    def update_knowledge(
+        self,
+        repository_path: str,
+        branch: str,
+        changes: List[FileChange],
+        model: str | None = None,
+        local: bool = False,
+    ) -> Dict[str, Any]:
         """Update knowledge for the provided changed files only.
 
         Updates ``source_sha`` in metadata to the branch's current HEAD.
@@ -357,16 +606,27 @@ class KnowledgeAgent:
         ``_read_file_at_commit`` / ``git show <sha>:<path>``) rather than
         from the working-tree file on disk. This matters because changes
         are applied via the GitHub Contents API (one commit per file,
-        directly on GitHub), not local ``git commit``/``git push`` — so the
-        local working tree is not guaranteed to reflect the latest commits
-        even after a ``git fetch``. Reading from the object store at the
-        known commit SHA is correct regardless of working-tree state.
+        directly on GitHub) in git mode, not local ``git commit``/``git
+        push`` — so the local working tree is not guaranteed to reflect the
+        latest commits even after a ``git fetch``. Reading from the object
+        store at the known commit SHA is correct regardless of working-tree
+        state.
+
+        LOCAL MODE: local `apply_changes` writes plain files directly with
+        no commit at all, so there is no new commit for this content=None
+        path to read from — but it never needs to: the orchestrator's
+        `_run_repo_final` always calls `/update-knowledge` with `content`
+        already attached to each FileChange (straight from the Developer's
+        own output), so the content=None / `_read_file_at_commit` branch is
+        only ever exercised by the read-only drift-refresh callers
+        (`_refresh_if_drifted`, `_copy_branch_knowledge`) against a real git
+        checkout, where reading historical commits is legitimate.
         """
         repo = Path(repository_path).resolve()
         if not repo.exists():
             raise ValueError(f"Repository path does not exist: {repository_path}")
 
-        files_dir = self._files_dir(repository_path, branch)
+        files_dir = self._files_dir(repository_path, branch, local=local)
         files_dir.mkdir(parents=True, exist_ok=True)
 
         # Resolve once up front: every content=None read in this call uses
@@ -423,19 +683,21 @@ class KnowledgeAgent:
                         )
                     continue
 
-            knowledge = self._summarize_file(str(rel_path), content)
+            knowledge = self._summarize_file(str(rel_path), content, model=model)
             knowledge_file.parent.mkdir(parents=True, exist_ok=True)
             knowledge_file.write_text(json.dumps(knowledge, ensure_ascii=False, indent=2), encoding="utf-8")
             updated += 1
 
         # Update metadata including source_sha
-        metadata = self._read_metadata(repository_path, branch)
+        metadata = self._read_metadata(repository_path, branch, local=local)
         metadata["generated_at"] = datetime.utcnow().isoformat() + "Z"
         metadata["branch"] = branch
 
         # Record current HEAD as the new source_sha (reuse the SHA resolved
         # at the top of this call, so metadata reflects exactly the commit
-        # every content=None read in this call actually used)
+        # every content=None read in this call actually used). In local
+        # mode against a plain non-git folder, current_sha is None and this
+        # falls back to whatever was already stored (or "unknown").
         source_sha = current_sha or metadata.get("source_sha", "unknown")
         metadata["source_sha"] = source_sha
 
@@ -443,13 +705,13 @@ class KnowledgeAgent:
         files = list(files_dir.rglob("*.json"))
         metadata["files"] = len(files)
 
-        self._write_metadata(repository_path, branch, metadata)
+        self._write_metadata(repository_path, branch, metadata, local=local)
 
         logger.info("Knowledge update complete for branch %s: %d updated, %d removed (SHA %s)", branch, updated, removed, source_sha)
         return {"updated": updated, "removed": removed, "metadata": metadata}
 
-    def load_knowledge(self, repository_path: str, branch: str) -> Dict[str, Any]:
-        knowledge_dir = self._knowledge_dir(repository_path, branch)
+    def load_knowledge(self, repository_path: str, branch: str, local: bool = False) -> Dict[str, Any]:
+        knowledge_dir = self._knowledge_dir(repository_path, branch, local=local)
         if not knowledge_dir.exists():
             raise ValueError("Knowledge not found; build it first.")
 
@@ -474,6 +736,14 @@ class KnowledgeAgent:
         return result
 
     # -- Automatic branch sync ---------------------------------------------
+    #
+    # sync_all_branches / _delete_branch_knowledge intentionally take no
+    # `local` parameter and are never called in local mode — the whole
+    # point of /sync-branches is deleting knowledge for branches missing
+    # from `git branch -r`, and local mode has no `origin`, so that list is
+    # always empty and it would delete nearly all local knowledge on every
+    # run. The orchestrator gates this call on `if not self.local_path`, so
+    # these two methods simply never run for a local-mode workflow.
 
     def _delete_branch_knowledge(self, repository_path: str, branch: str) -> None:
         """Delete a branch's entire knowledge directory.
@@ -485,7 +755,7 @@ class KnowledgeAgent:
             shutil.rmtree(knowledge_dir)
             logger.info("Deleted knowledge directory for branch %s: %s", branch, knowledge_dir)
 
-    def sync_all_branches(self, repository_path: str) -> Dict[str, Any]:
+    def sync_all_branches(self, repository_path: str, model: str | None = None) -> Dict[str, Any]:
         """Bring every branch's knowledge in sync with the current git state.
 
         For brand-new branches that have no knowledge folder yet, this
@@ -498,6 +768,11 @@ class KnowledgeAgent:
         orchestrator-driven ``ensure_knowledge(..., known_parent=...)``
         path used during normal workflow runs), so it can only guess the
         configured default base branch.
+
+        Branches that already have knowledge are brought up to date via the
+        same ``_refresh_if_drifted`` helper ``ensure_knowledge`` uses, so
+        both paths detect and patch drift identically instead of keeping
+        separate copies of the diff-and-patch logic.
 
         Returns a summary like::
 
@@ -573,75 +848,28 @@ class KnowledgeAgent:
                         branch,
                         default_base,
                     )
-                    self._copy_branch_knowledge(repository_path, default_base, branch)
+                    # Refresh the base first so new branches are copied from
+                    # an up-to-date baseline, then let _copy_branch_knowledge's
+                    # own catch-up refresh handle any commits already on
+                    # `branch` beyond that baseline.
+                    self._refresh_if_drifted(repository_path, default_base, model=model)
+                    self._copy_branch_knowledge(repository_path, default_base, branch, model=model)
                 else:
                     logger.info(
                         "Sync: building knowledge for new branch %s (no base to copy from)",
                         branch,
                     )
-                    self.build_knowledge(repository_path, branch)
+                    self.build_knowledge(repository_path, branch, model=model)
                 created.append(branch)
                 continue
 
-            # Branch exists and has knowledge — check if it's drifted
-            metadata = self._read_metadata(repository_path, branch)
-            stored_sha = metadata.get("source_sha")
-            current_sha = _get_head_sha(repo, branch)
-
-            if current_sha is None:
-                # Can't resolve HEAD for this branch; skip update
-                logger.warning("Sync: cannot resolve HEAD for branch %s — skipping", branch)
-                unchanged.append(branch)
-                continue
-
-            if stored_sha == current_sha:
-                # No change
-                unchanged.append(branch)
-                continue
-
-            # Branch has moved — compute diff and update
-            logger.info(
-                "Sync: branch %s moved from %s to %s — updating knowledge",
-                branch,
-                stored_sha or "unknown",
-                current_sha,
-            )
-            try:
-                changed_files_raw = _run_git(repo, ["diff", "--name-only", stored_sha or current_sha, current_sha])
-            except RuntimeError:
-                # If the old SHA isn't reachable (e.g. force-push), rebuild
-                logger.warning(
-                    "Sync: cannot diff %s..%s for branch %s — rebuilding from scratch",
-                    stored_sha,
-                    current_sha,
-                    branch,
-                )
-                self.build_knowledge(repository_path, branch)
+            # Branch exists and has knowledge — refresh it if it has drifted,
+            # using the same shared logic ensure_knowledge relies on.
+            _metadata, drifted = self._refresh_if_drifted(repository_path, branch, model=model)
+            if drifted:
                 updated.append(branch)
-                continue
-
-            changed_paths = [p.strip() for p in changed_files_raw.splitlines() if p.strip()]
-
-            if not changed_paths:
-                # SHA changed but diff is empty (e.g. merge commit with no
-                # file-level changes) — just bump the source_sha
-                metadata["source_sha"] = current_sha
-                metadata["generated_at"] = datetime.utcnow().isoformat() + "Z"
-                self._write_metadata(repository_path, branch, metadata)
+            else:
                 unchanged.append(branch)
-                continue
-
-            # Build FileChange list
-            changes: List[FileChange] = []
-            for path in changed_paths:
-                file_on_disk = repo / path
-                if file_on_disk.exists():
-                    changes.append(FileChange(path=path, action="update", content=None))
-                else:
-                    changes.append(FileChange(path=path, action="delete", content=None))
-
-            self.update_knowledge(repository_path, branch, changes)
-            updated.append(branch)
 
         # c. Delete knowledge for branches that no longer exist
         for branch in sorted(existing_knowledge_branches):
@@ -675,17 +903,8 @@ class KnowledgeAgent:
 
     # -- Summarization (LLM) ----------------------------------------------
 
-    def _summarize_file(self, rel_path: str, content: str) -> Dict[str, Any]:
-        """Call the local LLM to summarize a single file into structured knowledge.
-
-        NOTE (markdown test): the outer envelope stays JSON — path/classes/
-        functions/imports/exports/metadata remain addressable fields, since
-        update_knowledge and the dashboard's json-viewer key off them
-        individually. Only `summary` (the field actually consumed as prose
-        by the Planner's prompt) is now requested as Markdown instead of a
-        plain string, to test whether the Planner reasons better/cheaper
-        over structured prose vs. flat text.
-        """
+    def _summarize_file(self, rel_path: str, content: str, model: str | None = None) -> Dict[str, Any]:
+        """Call the LLM via LiteLLM to summarize a single file into structured knowledge."""
         system = (
             "You are a project knowledge extractor. Read the file contents and produce a concise, "
             "structured JSON summary. Do NOT output source code or store the file contents. "
@@ -721,18 +940,20 @@ class KnowledgeAgent:
         )
 
         try:
-            response = self.client.chat.completions.create(
-                model=GROQ_MODEL,
+            selected_model = model or self.model  # override from orchestrator, or fallback default
+            response = litellm.completion(
+                model=selected_model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user_prompt}],
                 temperature=0.0,
+                max_tokens=LLM_MAX_TOKENS,
                 response_format={"type": "json_object"},
             )
 
-            content = response.choices[0].message.content
-            if not content:
+            response_content = response.choices[0].message.content
+            if not response_content:
                 raise ValueError("Empty model response")
 
-            data = json.loads(content)
+            data = json.loads(response_content)
             # Ensure required keys and types
             result = {
                 "path": rel_path,
@@ -747,10 +968,11 @@ class KnowledgeAgent:
             return result
         except Exception as exc:
             logger.warning("LLM summarization failed for %s: %s", rel_path, exc)
-            # Fallback simple extractor
-            imports = []
-            functions = []
-            classes = []
+            # Fallback simple extractor — works on the file content
+            # (method param `content`), not the LLM response.
+            imports: list[str] = []
+            functions: list[str] = []
+            classes: list[str] = []
             for line in content.splitlines():
                 line = line.strip()
                 if line.startswith("import ") or line.startswith("from "):
@@ -766,8 +988,6 @@ class KnowledgeAgent:
             return {
                 "path": rel_path,
                 "file_purpose": "",
-                # Fallback path has no LLM available to format markdown, so this
-                # stays plain text — it's a degraded-mode result, not the tested format.
                 "summary": fallback_summary,
                 "classes": classes,
                 "functions": functions,
@@ -789,7 +1009,9 @@ def ensure_knowledge_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
         repository_path = payload["repository_path"]
         branch = payload["branch"]
         known_parent = payload.get("known_parent")
-        return agent.ensure_knowledge(repository_path, branch, known_parent)
+        model = payload.get("model")
+        local = bool(payload.get("local", False))
+        return agent.ensure_knowledge(repository_path, branch, known_parent, model=model, local=local)
     except Exception as exc:
         logger.exception("ensure_knowledge failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -800,7 +1022,9 @@ def build_knowledge_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         repository_path = payload["repository_path"]
         branch = payload["branch"]
-        return agent.build_knowledge(repository_path, branch)
+        model = payload.get("model")
+        local = bool(payload.get("local", False))
+        return agent.build_knowledge(repository_path, branch, model=model, local=local)
     except Exception as exc:
         logger.exception("build_knowledge failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -811,17 +1035,19 @@ def update_knowledge_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         repository_path = payload["repository_path"]
         branch = payload["branch"]
+        model = payload.get("model")
+        local = bool(payload.get("local", False))
         changes = [FileChange(**c) for c in payload.get("changes", [])]
-        return agent.update_knowledge(repository_path, branch, changes)
+        return agent.update_knowledge(repository_path, branch, changes, model=model, local=local)
     except Exception as exc:
         logger.exception("update_knowledge failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/load-knowledge")
-def load_knowledge_endpoint(repository_path: str, branch: str) -> Dict[str, Any]:
+def load_knowledge_endpoint(repository_path: str, branch: str, local: bool = False) -> Dict[str, Any]:
     try:
-        return agent.load_knowledge(repository_path, branch)
+        return agent.load_knowledge(repository_path, branch, local=local)
     except Exception as exc:
         logger.exception("load_knowledge failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -832,6 +1058,11 @@ def sync_branches_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Sync knowledge for every git branch against the current repo state.
 
     Expects ``{"repository_path": "..."}``.
+
+    NOTE: this endpoint has no local-mode handling and must never be called
+    when local mode is active — see the module-level note above
+    sync_all_branches. The orchestrator is responsible for gating the call,
+    not this endpoint.
 
     Creates knowledge for new branches (copying from the default base
     branch when it already has knowledge, otherwise building from
@@ -845,7 +1076,8 @@ def sync_branches_endpoint(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     try:
         repository_path = payload["repository_path"]
-        return agent.sync_all_branches(repository_path)
+        model = payload.get("model")
+        return agent.sync_all_branches(repository_path, model=model)
     except Exception as exc:
         logger.exception("sync_branches failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc

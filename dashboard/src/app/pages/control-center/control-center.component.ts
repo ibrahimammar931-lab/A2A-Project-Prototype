@@ -5,12 +5,13 @@ import { GlobalControlBarComponent } from '../../components/global-control-bar/g
 import { PipelineGraphComponent } from '../../components/pipeline-graph/pipeline-graph.component';
 import { AgentInspectorComponent } from '../../components/agent-inspector/agent-inspector.component';
 import { ApprovalPanelComponent } from '../../components/approval-panel/approval-panel.component';
+import { ModelSelectionPanelComponent } from '../../components/model-selection-panel/model-selection-panel.component';
 import { WorkflowStateService } from '../../services/workflow-state.service';
 
 @Component({
   selector: 'app-control-center',
   standalone: true,
-  imports: [MatIconModule, MatSidenavModule, GlobalControlBarComponent, PipelineGraphComponent, AgentInspectorComponent, ApprovalPanelComponent],
+  imports: [MatIconModule, MatSidenavModule, GlobalControlBarComponent, PipelineGraphComponent, AgentInspectorComponent, ApprovalPanelComponent, ModelSelectionPanelComponent],
   template: `
     <app-global-control-bar />
     <mat-drawer-container autosize class="layout">
@@ -32,6 +33,7 @@ import { WorkflowStateService } from '../../services/workflow-state.service';
             </section>
           }
           <app-pipeline-graph />
+          <app-model-selection-panel />
         </main>
       </mat-drawer-content>
       <mat-drawer mode="side" position="end" opened>

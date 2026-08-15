@@ -4,3 +4,4 @@ pydantic==2.10.4
 openai==1.59.7
 httpx==0.28.1
 python-dotenv==1.0.1
+litellm==1.55.4

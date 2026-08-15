@@ -1,5 +1,6 @@
 export type WorkflowStatus = 'running' | 'waiting' | 'paused' | 'failed' | 'completed' | 'requires-revision';
 export type WorkflowMode = 'manual' | 'automatic';
+export type WorkspaceMode = 'git' | 'local';
 export type AgentStatus = 'waiting' | 'running' | 'success' | 'requires-revision' | 'failed';
 export type MessageStatus = 'queued' | 'pending-approval' | 'sent' | 'delivered' | 'edited' | 'failed';
 
@@ -13,9 +14,13 @@ export interface WorkflowSummary {
   totalExecutionTime: string;
   progress: number;
   manualMode: boolean;
+  workspaceMode?: WorkspaceMode;
   previousAgent: string;
   currentAgent: string;
   nextAgent: string;
+  previousStepId?: string | null;
+  currentStepId?: string | null;
+  nextStepId?: string | null;
 }
 
 export interface AgentFileActivity {
@@ -67,6 +72,13 @@ export interface WorkflowSnapshot {
   agents: AgentNode[];
   messages: AgentMessage[];
   activePath: string[];
+  workflowSteps?: WorkflowStep[];
+}
+
+export interface WorkflowStep {
+  id: string;
+  agentId: string;
+  name: string;
 }
 
 export interface WorkflowCommandResult {

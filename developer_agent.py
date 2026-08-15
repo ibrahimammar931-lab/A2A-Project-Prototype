@@ -1,11 +1,12 @@
 import json
 import logging
 
+import litellm
 from fastapi import FastAPI, HTTPException
-from openai import OpenAI
 
 from config import (
     GROQ_API_KEY,
+    LLM_MAX_TOKENS,
     GROQ_MODEL,
     check_config,
     configure_logging,
@@ -100,10 +101,6 @@ class DeveloperAgent:
     def __init__(self) -> None:
         check_config()
         self.model = GROQ_MODEL
-        self.client = OpenAI(
-            api_key=GROQ_API_KEY,
-            base_url="https://api.groq.com/openai/v1",
-        )
 
     def generate_code(
         self,
@@ -112,6 +109,7 @@ class DeveloperAgent:
         planning_result: PlanningResult | None = None,
         planned_new_files: list[str] | None = None,
         repo_files: list[RepoFile] | None = None,
+        model: str | None = None,
     ) -> DeveloperOutput:
         logger.info("Developer agent generating initial code")
         prompt = (
@@ -132,7 +130,7 @@ class DeveloperAgent:
             f"{format_plan(planning_result)}"
             f"{format_repo_files(repo_files or [])}"
         )
-        return self._ask_groq(prompt)
+        return self._call_llm(prompt, model)
 
     def improve_code(
         self,
@@ -143,6 +141,7 @@ class DeveloperAgent:
         planning_result: PlanningResult | None = None,
         planned_new_files: list[str] | None = None,
         repo_files: list[RepoFile] | None = None,
+        model: str | None = None,
     ) -> DeveloperOutput:
         logger.info("Developer agent improving code from review feedback")
         prompt = (
@@ -166,11 +165,12 @@ class DeveloperAgent:
             f"{format_plan(planning_result)}"
             f"{format_repo_files(repo_files or [])}"
         )
-        return self._ask_groq(prompt)
+        return self._call_llm(prompt, model)
 
-    def _ask_groq(self, prompt: str) -> DeveloperOutput:
-        response = self.client.chat.completions.create(
-            model=self.model,
+    def _call_llm(self, prompt: str, model: str | None = None) -> DeveloperOutput:
+        selected_model = model or self.model  # override from orchestrator, or fallback default
+        response = litellm.completion(
+            model=selected_model,
             messages=[
                 {
                     "role": "system",
@@ -185,6 +185,7 @@ class DeveloperAgent:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
+            max_tokens=LLM_MAX_TOKENS,
             response_format={"type": "json_object"},
         )
 
@@ -214,6 +215,7 @@ def generate_code(request: AgentTaskRequest) -> DeveloperOutput:
             request.planning_result,
             request.planned_new_files,
             request.repo_files,
+            model=request.model,
         )
     except ValueError as exc:
         logger.warning("Developer output validation failed: %s", exc)
@@ -247,6 +249,7 @@ def improve_code(message: AgentMessage) -> AgentMessage:
                 RepoFile(**repo_file)
                 for repo_file in message.payload.get("repo_files", [])
             ],
+            model=message.payload.get("model"),
         )
         return AgentMessage(
             sender="developer_agent",

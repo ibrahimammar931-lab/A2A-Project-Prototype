@@ -1,4 +1,4 @@
-import { Component, computed, inject } from '@angular/core';
+import { Component, computed, inject, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MatButtonModule } from '@angular/material/button';
 import { MatButtonToggleModule } from '@angular/material/button-toggle';
@@ -9,7 +9,7 @@ import { MatProgressBarModule } from '@angular/material/progress-bar';
 import { MatSlideToggleModule } from '@angular/material/slide-toggle';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { WorkflowStateService } from '../../services/workflow-state.service';
-import { WorkflowStatus } from '../../models/workflow.models';
+import { WorkflowStatus, WorkspaceMode } from '../../models/workflow.models';
 
 @Component({
   selector: 'app-global-control-bar',
@@ -35,22 +35,42 @@ import { WorkflowStatus } from '../../models/workflow.models';
       </div>
 
       <div class="start-inputs">
+        <div class="workspace-toggle">
+          <span>Workspace</span>
+          <mat-button-toggle-group [(ngModel)]="workspaceMode" hideSingleSelectionIndicator="true">
+            <mat-button-toggle value="git" matTooltip="Clone or update a GitHub repository and let the workflow create/apply to branches">
+              <mat-icon>cloud_sync</mat-icon>
+              Git Repo
+            </mat-button-toggle>
+            <mat-button-toggle value="local" matTooltip="Use the currently checked-out branch in a local git folder">
+              <mat-icon>folder_open</mat-icon>
+              Local Folder
+            </mat-button-toggle>
+          </mat-button-toggle-group>
+        </div>
         <mat-form-field appearance="outline">
           <mat-label>Ticket</mat-label>
           <input matInput [(ngModel)]="workflowTicket" placeholder="A2A-184">
         </mat-form-field>
-        <mat-form-field appearance="outline">
-          <mat-label>Base Branch</mat-label>
-          <input matInput [(ngModel)]="workflowBranch" placeholder="main">
-        </mat-form-field>
-        <mat-form-field appearance="outline">
-          <mat-label>Existing Branch</mat-label>
-          <input matInput [(ngModel)]="workflowExistingBranch" placeholder="feature/my-branch">
-        </mat-form-field>
-        <mat-form-field appearance="outline">
-          <mat-label>Repo URL</mat-label>
-          <input matInput [(ngModel)]="workflowRepoUrl" placeholder="https://github.com/owner/repo">
-        </mat-form-field>
+        @if (workspaceMode === 'git') {
+          <mat-form-field appearance="outline">
+            <mat-label>Base Branch</mat-label>
+            <input matInput [(ngModel)]="workflowBranch" placeholder="main">
+          </mat-form-field>
+          <mat-form-field appearance="outline">
+            <mat-label>Existing Branch</mat-label>
+            <input matInput [(ngModel)]="workflowExistingBranch" placeholder="feature/my-branch">
+          </mat-form-field>
+          <mat-form-field appearance="outline">
+            <mat-label>Repo URL</mat-label>
+            <input matInput [(ngModel)]="workflowRepoUrl" placeholder="https://github.com/owner/repo">
+          </mat-form-field>
+        } @else {
+          <mat-form-field appearance="outline" class="local-path">
+            <mat-label>Local Folder Path</mat-label>
+            <input matInput [(ngModel)]="workflowLocalPath" placeholder="C:\\Users\\you\\project">
+          </mat-form-field>
+        }
       </div>
 
       <div class="actions">
@@ -65,7 +85,18 @@ import { WorkflowStatus } from '../../models/workflow.models';
           </mat-button-toggle>
         </mat-button-toggle-group>
 
-        <mat-slide-toggle [(ngModel)]="workflowOpenPr" color="primary" matTooltip="Open a pull request after applying changes">
+        <mat-slide-toggle
+          [ngModel]="workflow.autoModelSelection()"
+          (ngModelChange)="onAutoModelToggle($event)"
+          color="accent"
+          matTooltip="Let the LLM-based Model Selector choose which model each agent uses (Auto) or pick them yourself (Manual)">
+          <span class="auto-model-label">
+            <mat-icon>psychology</mat-icon>
+            {{ workflow.autoModelSelection() ? 'Auto Models' : 'Manual Models' }}
+          </span>
+        </mat-slide-toggle>
+
+        <mat-slide-toggle [(ngModel)]="workflowOpenPr" color="primary" [disabled]="workspaceMode === 'local'" matTooltip="Open a pull request after applying changes">
           Open PR
         </mat-slide-toggle>
 
@@ -77,7 +108,7 @@ import { WorkflowStatus } from '../../models/workflow.models';
           <mat-icon>stop</mat-icon>
           Stop
         </button>
-        <button mat-stroked-button (click)="workflow.restartWorkflow()">
+        <button mat-stroked-button (click)="restartWorkflow()">
           <mat-icon>restart_alt</mat-icon>
           Restart
         </button>
@@ -110,9 +141,26 @@ import { WorkflowStatus } from '../../models/workflow.models';
 
     .start-inputs {
       display: grid;
-      grid-template-columns: minmax(180px, 260px) minmax(180px, 260px) minmax(180px, 260px) minmax(180px, 260px);
+      grid-template-columns: minmax(220px, 320px) minmax(180px, 260px) minmax(180px, 260px) minmax(180px, 260px) minmax(180px, 260px);
       gap: 10px;
       align-items: start;
+    }
+
+    .workspace-toggle {
+      display: grid;
+      gap: 4px;
+      min-width: 220px;
+    }
+
+    .workspace-toggle > span {
+      color: #94a3b8;
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .local-path {
+      grid-column: span 3;
     }
 
     .metric {
@@ -165,6 +213,18 @@ import { WorkflowStatus } from '../../models/workflow.models';
       margin-right: 6px;
     }
 
+    .auto-model-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .auto-model-label mat-icon {
+      font-size: 18px;
+      width: 18px;
+      height: 18px;
+    }
+
     @media (max-width: 720px) {
       .control-bar {
         padding: 12px;
@@ -180,7 +240,7 @@ import { WorkflowStatus } from '../../models/workflow.models';
     }
   `]
 })
-export class GlobalControlBarComponent {
+export class GlobalControlBarComponent implements OnInit {
   readonly workflow = inject(WorkflowStateService);
   readonly summary = this.workflow.summary;
   readonly statusClass = computed(() => `state-${this.summary().status}`);
@@ -189,9 +249,15 @@ export class GlobalControlBarComponent {
   workflowBranch = localStorage.getItem('workflowBranch') ?? '';
   workflowExistingBranch = localStorage.getItem('workflowExistingBranch') ?? '';
   workflowRepoUrl = localStorage.getItem('workflowRepoUrl') ?? '';
+  workflowLocalPath = localStorage.getItem('workflowLocalPath') ?? '';
+  workspaceMode: WorkspaceMode = (localStorage.getItem('workspaceMode') as WorkspaceMode | null) ?? 'git';
   workflowOpenPr = localStorage.getItem('workflowOpenPr') !== 'false';
   label(value: string): string {
     return value.split('-').map((part) => part[0].toUpperCase() + part.slice(1)).join(' ');
+  }
+
+  ngOnInit(): void {
+    this.workflow.fetchAutoModelSelection();
   }
 
   onModeToggle(event: any): void {
@@ -199,18 +265,36 @@ export class GlobalControlBarComponent {
     this.workflow.setMode(newMode);
   }
 
+  onAutoModelToggle(enabled: boolean): void {
+    this.workflow.setAutoModelSelection(enabled);
+  }
+
   startWorkflow(): void {
     const ticket = this.workflowTicket.trim();
     const branch = this.workflowBranch.trim() || 'main';
     const existingBranch = this.workflowExistingBranch.trim();
-    const openPr = this.workflowOpenPr;
+    const openPr = this.workspaceMode === 'git' && this.workflowOpenPr;
     const repoUrl = this.workflowRepoUrl.trim();
+    const localPath = this.workflowLocalPath.trim();
     localStorage.setItem('workflowTicket', ticket);
     localStorage.setItem('workflowBranch', branch);
     localStorage.setItem('workflowExistingBranch', existingBranch);
     localStorage.setItem('workflowOpenPr', String(openPr));
     localStorage.setItem('workflowRepoUrl', repoUrl);
-    this.workflow.startWorkflow(ticket, branch, existingBranch, openPr, repoUrl);
+    localStorage.setItem('workflowLocalPath', localPath);
+    localStorage.setItem('workspaceMode', this.workspaceMode);
+    this.workflow.startWorkflow(ticket, branch, existingBranch, openPr, repoUrl, this.workspaceMode, localPath);
+  }
+
+  restartWorkflow(): void {
+    const openPr = this.workspaceMode === 'git' && this.workflowOpenPr;
+    this.workflow.restartWorkflow(
+      this.workflowExistingBranch.trim(),
+      openPr,
+      this.workflowRepoUrl.trim(),
+      this.workspaceMode,
+      this.workflowLocalPath.trim()
+    );
   }
 }
 
