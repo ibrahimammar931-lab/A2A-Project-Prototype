@@ -195,13 +195,6 @@ You can also use `run_all.ps1` to launch all services in separate PowerShell win
 .\run_all.ps1
 ```
 
-If imports fail when using the script, set `PYTHONPATH` first in the same terminal:
-
-```powershell
-$env:PYTHONPATH = "$PWD\agents;$PWD\shared"
-.\run_all.ps1
-```
-
 ## Run the Dashboard
 
 The dashboard is configured to proxy `/api` to the orchestrator on `http://127.0.0.1:8010`.
@@ -374,7 +367,6 @@ Invoke-RestMethod `
 
 - This is a local prototype intended for development and experimentation.
 - The dashboard expects the orchestrator on port `8010`.
-- `run_all.ps1` starts all services, but the current module layout still requires `shared` to be present in `PYTHONPATH`.
+- `run_all.ps1` starts all services and sets `PYTHONPATH` for the moved `agents/` and `shared/` modules.
 - GitHub mode applies file changes through the GitHub Contents API. Local clones are used for context and knowledge, but file commits are created remotely.
 - Local-folder mode applies changes directly to the selected local Git checkout and disables pull request creation.
-- `agents/knowledge_agent.py` currently uses `hashlib.sha1()` in local knowledge ID generation and should import `hashlib` before that path is used.

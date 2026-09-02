@@ -1,6 +1,6 @@
 # Setup Guide
 
-This guide is for the current version of the repository and reflects the services and configuration supported by the code in [config.py](config.py), [available_models.py](available_models.py), and the FastAPI entry points.
+This guide is for the current version of the repository and reflects the services and configuration supported by the code in [shared/config.py](shared/config.py), [shared/available_models.py](shared/available_models.py), and the FastAPI entry points in [agents/](agents/).
 
 ## Requirements
 
@@ -73,38 +73,44 @@ Optional provider keys like `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and other mod
 
 ## 3. Start the services
 
+The agent modules live in `agents/`, while shared modules live in `shared/`. Set `PYTHONPATH` first so the moved modules can import `config`, `schemas`, and `available_models`:
+
+```powershell
+$env:PYTHONPATH = "$PWD\agents;$PWD\shared"
+```
+
 Open one terminal per service and run these commands from the project root.
 
-```bash
-uvicorn jira_agent:app --port 8001 --reload
+```powershell
+uvicorn agents.jira_agent:app --port 8001 --reload
 ```
 
-```bash
-uvicorn reviewer_agent:app --port 8002 --reload
+```powershell
+uvicorn agents.reviewer_agent:app --port 8002 --reload
 ```
 
-```bash
-uvicorn developer_agent:app --port 8000 --reload
+```powershell
+uvicorn agents.developer_agent:app --port 8000 --reload
 ```
 
-```bash
-uvicorn repo_agent:app --port 8004 --reload
+```powershell
+uvicorn agents.repo_agent:app --port 8004 --reload
 ```
 
-```bash
-uvicorn knowledge_agent:app --port 8005 --reload
+```powershell
+uvicorn agents.knowledge_agent:app --port 8005 --reload
 ```
 
-```bash
-uvicorn planner_agent:app --port 8006 --reload
+```powershell
+uvicorn agents.planner_agent:app --port 8006 --reload
 ```
 
-```bash
-uvicorn model_selector_agent:app --port 8007 --reload
+```powershell
+uvicorn agents.model_selector_agent:app --port 8007 --reload
 ```
 
-```bash
-uvicorn orchestrator_agent:app --port 8003 --reload
+```powershell
+uvicorn agents.orchestrator_agent:app --port 8010 --reload
 ```
 
 ## 4. Check the docs
@@ -115,11 +121,11 @@ FastAPI Swagger UI is available for each service:
 http://127.0.0.1:8000/docs
 http://127.0.0.1:8001/docs
 http://127.0.0.1:8002/docs
-http://127.0.0.1:8003/docs
 http://127.0.0.1:8004/docs
 http://127.0.0.1:8005/docs
 http://127.0.0.1:8006/docs
 http://127.0.0.1:8007/docs
+http://127.0.0.1:8010/docs
 ```
 
 ## 5. Start the dashboard
@@ -146,16 +152,17 @@ A quick Python syntax check is useful before launching the full workflow:
 
 ```powershell
 .\.venv\Scripts\python.exe -m py_compile `
-  config.py `
-  schemas.py `
-  jira_agent.py `
-  developer_agent.py `
-  reviewer_agent.py `
-  repo_agent.py `
-  knowledge_agent.py `
-  planner_agent.py `
-  model_selector_agent.py `
-  orchestrator_agent.py
+  agents\jira_agent.py `
+  agents\developer_agent.py `
+  agents\reviewer_agent.py `
+  agents\repo_agent.py `
+  agents\knowledge_agent.py `
+  agents\planner_agent.py `
+  agents\model_selector_agent.py `
+  agents\orchestrator_agent.py `
+  shared\config.py `
+  shared\schemas.py `
+  shared\available_models.py
 ```
 
 If that passes, the backend code is structurally valid and ready to start.
@@ -165,7 +172,7 @@ If that passes, the backend code is structurally valid and ready to start.
 - Missing model API key: the app raises an error if no configured model credentials are present.
 - Missing Jira config: `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` are required to fetch tickets.
 - Missing GitHub repo details: repo operations need `GITHUB_REPO_URL` and `GITHUB_TOKEN`.
-- Dashboard not loading: ensure the orchestrator is running on port 8003 and the Angular app is built or served on port 4200.
+- Dashboard not loading: ensure the orchestrator is running on port 8010 and the Angular app is built or served on port 4200.
 
 ## 8. Recommended first run
 

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import hashlib
 import shutil
 import subprocess
 from datetime import datetime
