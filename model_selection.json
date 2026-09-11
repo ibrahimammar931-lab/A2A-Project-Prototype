@@ -1,7 +1,7 @@
 {
-  "knowledge": "openrouter/qwen/qwen3.7-flash",
-  "planner": "openrouter/qwen/qwen3.7-flash",
-  "developer": "openrouter/qwen/qwen3.7-flash",
-  "reviewer": "openrouter/qwen/qwen3.7-flash",
-  "model_selector": "deepseek/deepseek-v4-flash"
+  "knowledge": "",
+  "planner": "",
+  "developer": "",
+  "reviewer": "",
+  "model_selector": ""
 }
