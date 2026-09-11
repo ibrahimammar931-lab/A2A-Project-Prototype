@@ -1,6 +1,6 @@
 # Multi-Agent Automation System for Software Development Workflows
 
-A2A is a local prototype for automating a software development workflow with specialized agents. Starting from a Jira ticket, the system prepares a target repository, builds repository knowledge, plans the implementation, generates code, reviews the proposed changes, applies them to a branch or local folder, and can open a GitHub pull request.
+The project is a local prototype for automating a software development workflow with specialized agents. Starting from a Jira ticket, the system prepares a target repository, builds repository knowledge, plans the implementation, generates code, reviews the proposed changes, applies them to a branch or local folder, and can open a GitHub pull request.
 
 The backend is a set of FastAPI services. The frontend is an Angular dashboard used to start, monitor, and manually control the workflow.
 
